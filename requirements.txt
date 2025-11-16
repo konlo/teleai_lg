@@ -1,0 +1,9 @@
+langgraph==1.0.3
+streamlit==1.51.0
+openai==2.7.2
+google-generativeai==0.8.5
+python-dotenv==1.2.1
+databricks-sql-connector==4.1.4
+matplotlib==3.10.7
+seaborn==0.13.2
+pandas==2.2.3
