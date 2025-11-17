@@ -83,6 +83,14 @@ def _normalize_json_literals(code: str) -> str:
     return JSON_LITERAL_PATTERN.sub(lambda match: replacements[match.group(1)], code)
 
 
+def _is_graphviz_code(code: str) -> bool:
+    """Heuristically detect Graphviz/DOT snippets to avoid exec syntax errors."""
+
+    normalized = code.lstrip()
+    candidates = ("digraph", "graph", "strict digraph", "strict graph")
+    return normalized.lower().startswith(candidates) or "rankdir=" in code
+
+
 def _execute_visualization_code(code: str) -> List[bytes]:
     """Run plotting code and return rendered figure PNG bytes."""
     import matplotlib
@@ -150,6 +158,11 @@ def _handle_visualization_blocks(text: str) -> None:
         return
     message_index = len(st.session_state.history) - 1
     for idx, code in enumerate(code_blocks, start=1):
+        if _is_graphviz_code(code):
+            st.graphviz_chart(code)
+            _append_visualization_message(
+                message_index, "info", f"Code block {idx} Graphviz 렌더링 완료.")
+            continue
         try:
             images = _execute_visualization_code(code)
         except Exception as exc:  # pragma: no cover - Streamlit surface
