@@ -27,6 +27,10 @@ TABLE_LOAD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CODE_BLOCK_PATTERN = re.compile(r"```(?:python)?\s*([\s\S]+?)```", re.IGNORECASE)
+# Replace JSON-style literals with Python equivalents when the LLM emits
+# visualization code snippets. This avoids NameError when the model returns
+# data samples containing null/true/false.
+JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
 LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
     "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
@@ -72,6 +76,13 @@ def _extract_code_blocks(text: str) -> List[str]:
     return [match.group(1).strip() for match in CODE_BLOCK_PATTERN.finditer(text)]
 
 
+def _normalize_json_literals(code: str) -> str:
+    """Convert JSON-style literals (null/true/false) to Python values."""
+
+    replacements = {"null": "None", "true": "True", "false": "False"}
+    return JSON_LITERAL_PATTERN.sub(lambda match: replacements[match.group(1)], code)
+
+
 def _execute_visualization_code(code: str) -> List[bytes]:
     """Run plotting code and return rendered figure PNG bytes."""
     import matplotlib
@@ -79,9 +90,18 @@ def _execute_visualization_code(code: str) -> List[bytes]:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    normalized_code = _normalize_json_literals(code)
     exec_globals: Dict[str, Any] = {"__name__": "__main__"}
     before = set(plt.get_fignums())
-    exec(code, exec_globals, exec_globals)
+    try:
+        exec(normalized_code, exec_globals, exec_globals)
+    except SyntaxError as exc:  # pragma: no cover - handled in UI path
+        details = exc.msg
+        if exc.text:
+            details += f" -> {exc.text.strip()}"
+        if exc.lineno is not None:
+            details += f" (line {exc.lineno})"
+        raise SyntaxError(details) from exc
     after = set(plt.get_fignums())
     new_figs = [plt.figure(num) for num in sorted(after - before)]
     images: List[bytes] = []
