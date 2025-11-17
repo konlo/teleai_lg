@@ -101,6 +101,26 @@ def _openai_response(messages: List[ChatMessage]) -> str:
     return completion.choices[0].message.content or ""
 
 
+def _azure_response(messages: List[ChatMessage]) -> str:
+    from openai import AzureOpenAI
+
+    api_key = _ensure_key("AZURE_OPENAI_API_KEY", "Azure OpenAI")
+    endpoint = _ensure_key("AZURE_OPENAI_ENDPOINT", "Azure OpenAI")
+    deployment = _ensure_key("AZURE_OPENAI_DEPLOYMENT", "Azure OpenAI")
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+    client = AzureOpenAI(
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=endpoint,
+    )
+    completion = client.chat.completions.create(
+        model=deployment,
+        messages=[{"role": msg["role"], "content": msg["content"]} for msg in messages],
+        temperature=0.3,
+    )
+    return completion.choices[0].message.content or ""
+
+
 def _google_response(messages: List[ChatMessage]) -> str:
     import google.generativeai as genai
 
@@ -131,6 +151,8 @@ def _google_response(messages: List[ChatMessage]) -> str:
 def _invoke_provider(messages: List[ChatMessage], provider: str) -> ChatMessage:
     if provider == "google":
         content = _google_response(messages)
+    elif provider == "azure":
+        content = _azure_response(messages)
     else:
         content = _openai_response(messages)
     return {"role": "assistant", "content": content.strip()}
