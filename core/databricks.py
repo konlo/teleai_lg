@@ -32,8 +32,8 @@ def _connection_args() -> Tuple[str, str, str]:
 def _default_catalog_schema(
     catalog: str | None = None, schema: str | None = None
 ) -> Tuple[str, str]:
-    db_catalog = catalog or os.environ.get("DATABRICKS_CATALOG", "workspace")
-    db_schema = schema or os.environ.get("DATABRICKS_SCHEMA", "default")
+    db_catalog = catalog or _get_required("DATABRICKS_CATALOG")
+    db_schema = schema or _get_required("DATABRICKS_SCHEMA")
     return db_catalog, db_schema
 
 
