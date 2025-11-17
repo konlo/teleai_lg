@@ -205,14 +205,16 @@ def main() -> None:
 
     with st.sidebar:
         provider = os.environ.get("LLM_PROVIDER", "google").lower()
-        if provider not in {"google", "openai"}:
+        if provider not in {"google", "openai", "azure"}:
             provider = "google"
         st.markdown(
             f"**LLM Provider:** `{provider}` (set `LLM_PROVIDER` in your environment to change)"
         )
         st.caption(
-            "Configure the matching API key (`GOOGLE_API_KEY` or `OPENAI_API_KEY`) plus "
-            "optional `GOOGLE_MODEL` / `OPENAI_MODEL` before launching the app."
+            "Configure the matching API settings: `GOOGLE_API_KEY` (and optional "
+            "`GOOGLE_MODEL`), or `OPENAI_API_KEY` (plus optional `OPENAI_MODEL`), or "
+            "Azure values `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, "
+            "`AZURE_OPENAI_DEPLOYMENT` (plus optional `AZURE_OPENAI_API_VERSION`)."
         )
         if (
             "graph" not in st.session_state
