@@ -35,6 +35,7 @@ LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
     "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
     "sql_generator": "스키마를 참고해 SQL 생성",
+    "sql_validator": "생성된 SQL 안전성 및 구문 검증",
     "run_query": "Databricks에서 SQL 실행",
     "visualization": "쿼리 결과를 이용한 시각화 코드 작성",
     "response": "최종 답변/요약 작성",
@@ -49,7 +50,10 @@ digraph {
     intent -> sql_generator [label="visualize/sql"];
     intent -> clarify [label="clarify"];
     intent -> response [label="simple"];
-    sql_generator -> run_query;
+    sql_generator -> sql_validator;
+    sql_validator -> sql_generator [label="retry"];
+    sql_validator -> run_query [label="pass"];
+    sql_validator -> error [label="max fail"];
     run_query -> visualization [label="visualize"];
     run_query -> response [label="sql only"];
     run_query -> error [label="error"];
@@ -321,48 +325,52 @@ def main() -> None:
             table_name = _match_table_reference(prompt, tables)
 
         with st.chat_message("assistant"):
+            assistant_segments: List[str] = []
             if table_name:
                 try:
                     sql_statement, rows = fetch_table_preview(
                         table_name, limit=TABLE_PREVIEW_LIMIT
                     )
                     row_count = len(rows)
-                    text = (
+                    preview_text = (
                         f"Detected reference to `{table_name}` and loaded "
                         f"{row_count} row(s) (limit {TABLE_PREVIEW_LIMIT})."
                     )
-                    st.markdown(text)
+                    assistant_segments.append(preview_text)
+                    st.markdown(preview_text)
                     st.code(sql_statement, language="sql")
                     if rows:
                         st.dataframe(rows, use_container_width=True)
                     else:
                         st.info("No data returned for this table.")
                 except Exception as exc:  # pragma: no cover - Streamlit surface
-                    text = f"⚠️ Error loading `{table_name}`: {exc}"
-                    st.markdown(text)
-                st.session_state.history.append(("assistant", text))
-            else:
-                node_path: List[str] = []
-                try:
-                    graph = st.session_state.graph
-                    metadata = st.session_state.get("table_metadata", {})
-                    response_state = graph.invoke(
-                        {
-                            "messages": _lc_messages(st.session_state.history),
-                            "table_metadata": metadata,
-                        }
-                    )
-                    latest = response_state["messages"][-1]
-                    text = latest["content"]
-                    node_path = response_state.get("node_path", [])
-                except Exception as exc:  # pragma: no cover - Streamlit surface
-                    text = f"⚠️ Error: {exc}"
-                st.session_state.history.append(("assistant", text))
-                message_index = len(st.session_state.history) - 1
-                st.markdown(text)
-                _handle_visualization_blocks(text)
-                _store_node_path(message_index, node_path)
-                _render_node_flow(message_index)
+                    preview_text = f"⚠️ Error loading `{table_name}`: {exc}"
+                    assistant_segments.append(preview_text)
+                    st.markdown(preview_text)
+
+            node_path: List[str] = []
+            try:
+                graph = st.session_state.graph
+                metadata = st.session_state.get("table_metadata", {})
+                response_state = graph.invoke(
+                    {
+                        "messages": _lc_messages(st.session_state.history),
+                        "table_metadata": metadata,
+                    }
+                )
+                latest = response_state["messages"][-1]
+                response_text = latest["content"]
+                node_path = response_state.get("node_path", [])
+            except Exception as exc:  # pragma: no cover - Streamlit surface
+                response_text = f"⚠️ Error: {exc}"
+            assistant_segments.append(response_text)
+            combined_text = "\n\n".join(segment for segment in assistant_segments if segment)
+            st.session_state.history.append(("assistant", combined_text))
+            message_index = len(st.session_state.history) - 1
+            st.markdown(response_text)
+            _handle_visualization_blocks(response_text)
+            _store_node_path(message_index, node_path)
+            _render_node_flow(message_index)
 
 
 if __name__ == "__main__":

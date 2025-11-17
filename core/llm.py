@@ -37,6 +37,8 @@ class AgentState(TypedDict, total=False):
     user_query: str
     intent: AgentIntent
     sql_query: str
+    sql_validation_error: str
+    sql_retry_count: int
     query_result: List[Dict[str, Any]]
     visualization_code: str
     response: str
@@ -79,6 +81,9 @@ def _format_metadata(table_metadata: Dict[str, Any] | None) -> str:
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
+SQL_DANGER_PATTERN = re.compile(r"(?i)\b(drop|delete|alter|update|insert|merge|truncate)\b")
+SQL_SELECT_PATTERN = re.compile(r"(?i)\bselect\b")
+SQL_VALIDATION_MAX_RETRIES = 2
 
 
 def _strip_code_block(text: str) -> str:
@@ -111,6 +116,55 @@ def _node_path_diagram(node_path: List[str]) -> str:
         f"\n\n사용된 LangGraph 경로: {arrow_line}\n"
         f"```dot\n{diagram}\n```"
     )
+
+
+def _count_select_columns(statement: str) -> int:
+    match = re.search(r"(?i)\bselect\b\s+(.*?)\bfrom\b", statement, re.S)
+    if not match:
+        return 0
+    select_clause = match.group(1)
+    columns: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for char in select_clause:
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        elif char == "," and depth == 0:
+            columns.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current:
+        columns.append("".join(current).strip())
+    return len([col for col in columns if col])
+
+
+def _validate_sql_statement(statement: str) -> str | None:
+    normalized = statement.strip()
+    if not normalized:
+        return "SQL 문장이 비어 있습니다."
+    if SQL_DANGER_PATTERN.search(normalized):
+        return "DDL/DML 구문(DROP/DELETE 등)은 허용되지 않습니다."
+    select_matches = SQL_SELECT_PATTERN.findall(normalized)
+    if len(select_matches) > 1:
+        return "단일 SELECT 문만 허용됩니다."
+    semicolons = normalized.count(";")
+    if semicolons > 1 or (semicolons == 1 and not normalized.endswith(";")):
+        return "세미콜론으로 구분된 다중 쿼리는 지원되지 않습니다."
+    column_count = _count_select_columns(normalized)
+    group_match = re.search(r"(?i)group\s+by\s+([0-9,\s]+)", normalized)
+    if column_count and group_match:
+        numbers = [int(token) for token in re.findall(r"\d+", group_match.group(1))]
+        if numbers and max(numbers) > column_count:
+            return "GROUP BY 인덱스가 SELECT 항목 수를 초과합니다."
+    order_match = re.search(r"(?i)order\s+by\s+([0-9,\s]+)", normalized)
+    if column_count and order_match:
+        numbers = [int(token) for token in re.findall(r"\d+", order_match.group(1))]
+        if numbers and max(numbers) > column_count:
+            return "ORDER BY 인덱스가 SELECT 항목 수를 초과합니다."
+    return None
 
 
 def _openai_response(messages: List[ChatMessage]) -> str:
@@ -231,6 +285,8 @@ def build_conversation_graph(provider: str | None = None):
     def generate_sql(state: AgentState) -> AgentState:
         query = state.get("user_query", "")
         metadata = _format_metadata(state.get("table_metadata"))
+        feedback = state.get("sql_validation_error")
+        retry_count = state.get("sql_retry_count", 0)
         system_prompt = (
             "You are a Databricks SQL expert. Generate safe SQL answers that only read data. "
             "Always include an explicit LIMIT <= 500 if the query might return many rows. "
@@ -241,9 +297,32 @@ def build_conversation_graph(provider: str | None = None):
             f"Schema information:\n{metadata}\n\nUser request:\n{query}\n\n"
             "Return only the SQL query."
         )
+        if feedback:
+            user_prompt += (
+                "\n\nA previous attempt failed automatic validation for this reason:\n"
+                f"{feedback}\n"
+                "Revise the SQL accordingly and ensure only one SELECT statement is returned."
+            )
+        if retry_count:
+            user_prompt += f"\n(Attempt #{retry_count + 1} — pay extra attention to syntax.)"
         raw_sql = _call_llm(selected, system_prompt, user_prompt).strip()
         sql = _strip_code_block(raw_sql)
         return with_path(state, "sql_generator", {"sql_query": sql})
+
+    def validate_sql(state: AgentState) -> AgentState:
+        statement = state.get("sql_query", "")
+        validation_error = _validate_sql_statement(statement)
+        retries = state.get("sql_retry_count", 0)
+        updates: AgentState = {}
+        if validation_error:
+            retries += 1
+            updates["sql_validation_error"] = validation_error
+            updates["sql_retry_count"] = retries
+            if retries >= SQL_VALIDATION_MAX_RETRIES:
+                updates["error_message"] = f"SQL 검증 실패: {validation_error}"
+        else:
+            updates["sql_validation_error"] = ""
+        return with_path(state, "sql_validator", updates)
 
     def execute_sql(state: AgentState) -> AgentState:
         statement = state.get("sql_query", "")
@@ -357,6 +436,13 @@ def build_conversation_graph(provider: str | None = None):
             return "clarify"
         return "response"
 
+    def route_validation(state: AgentState) -> str:
+        if state.get("sql_validation_error"):
+            if state.get("sql_retry_count", 0) >= SQL_VALIDATION_MAX_RETRIES:
+                return "error"
+            return "sql_generator"
+        return "run_query"
+
     def route_query(state: AgentState) -> str:
         if state.get("error_message"):
             return "error"
@@ -367,6 +453,7 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("intent", classify_intent)
     workflow.add_node("sql_generator", generate_sql)
+    workflow.add_node("sql_validator", validate_sql)
     workflow.add_node("run_query", execute_sql)
     workflow.add_node("visualization", plan_visualization)
     workflow.add_node("response", respond)
@@ -384,7 +471,16 @@ def build_conversation_graph(provider: str | None = None):
             "response": "response",
         },
     )
-    workflow.add_edge("sql_generator", "run_query")
+    workflow.add_edge("sql_generator", "sql_validator")
+    workflow.add_conditional_edges(
+        "sql_validator",
+        route_validation,
+        {
+            "sql_generator": "sql_generator",
+            "run_query": "run_query",
+            "error": "error",
+        },
+    )
     workflow.add_conditional_edges(
         "run_query",
         route_query,
