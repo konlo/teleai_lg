@@ -41,6 +41,7 @@ class AgentState(TypedDict, total=False):
     visualization_code: str
     response: str
     error_message: str
+    node_path: List[str]
 
 
 def _ensure_key(var_name: str, provider_label: str) -> str:
@@ -85,6 +86,31 @@ def _strip_code_block(text: str) -> str:
     if match:
         return match.group(1).strip()
     return (text or "").strip()
+
+
+def _node_path_diagram(node_path: List[str]) -> str:
+    if not node_path:
+        return ""
+    arrow_line = " \u2192 ".join(node_path)
+    lines = [
+        "digraph {",
+        "  rankdir=LR;",
+        '  node [shape=box, style="rounded,filled", fillcolor="#EEF3FF"];',
+    ]
+    node_ids: List[str] = []
+    for idx, node_name in enumerate(node_path):
+        node_id = f"n{idx}"
+        node_ids.append(node_id)
+        safe_label = node_name.replace('"', r"\"")
+        lines.append(f'  {node_id} [label="{safe_label}"];')
+    for left, right in zip(node_ids, node_ids[1:]):
+        lines.append(f"  {left} -> {right};")
+    lines.append("}")
+    diagram = "\n".join(lines)
+    return (
+        f"\n\n사용된 LangGraph 경로: {arrow_line}\n"
+        f"```dot\n{diagram}\n```"
+    )
 
 
 def _openai_response(messages: List[ChatMessage]) -> str:
@@ -273,6 +299,8 @@ def build_conversation_graph(provider: str | None = None):
         final_text = reply
         if visualization_code:
             final_text = f"{reply}\n\n{visualization_code}"
+        response_path = list(state.get("node_path", [])) + ["response"]
+        final_text = f"{final_text}{_node_path_diagram(response_path)}"
         messages = state.get("messages", [])
         return with_path(
             state,
@@ -292,12 +320,14 @@ def build_conversation_graph(provider: str | None = None):
         user_prompt = f"User query:\n{user_query}\n\nAsk what detail is missing."
         reply = _call_llm(selected, system_prompt, user_prompt).strip()
         messages = state.get("messages", [])
+        clarify_path = list(state.get("node_path", [])) + ["clarify"]
+        final_text = f"{reply}{_node_path_diagram(clarify_path)}"
         return with_path(
             state,
             "clarify",
             {
-                "response": reply,
-                "messages": messages + [{"role": "assistant", "content": reply}],
+                "response": final_text,
+                "messages": messages + [{"role": "assistant", "content": final_text}],
             },
         )
 
@@ -308,12 +338,14 @@ def build_conversation_graph(provider: str | None = None):
             f"세부 정보: {error_message}\n다시 시도하거나 조건을 조정해 주세요."
         )
         messages = state.get("messages", [])
+        error_path = list(state.get("node_path", [])) + ["error"]
+        final_text = f"{text}{_node_path_diagram(error_path)}"
         return with_path(
             state,
             "error",
             {
-                "response": text,
-                "messages": messages + [{"role": "assistant", "content": text}],
+                "response": final_text,
+                "messages": messages + [{"role": "assistant", "content": final_text}],
             },
         )
 
