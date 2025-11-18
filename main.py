@@ -33,11 +33,15 @@ CODE_BLOCK_PATTERN = re.compile(r"```(?:python)?\s*([\s\S]+?)```", re.IGNORECASE
 JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
 LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
+    "prepare_tables": "질문/스키마에서 순차 처리 테이블 선정",
     "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
+    "table_select": "다음 테이블 선택 및 상태 업데이트",
+    "table_sql": "선택된 테이블용 안전한 SQL 생성",
     "sql_generator": "스키마를 참고해 SQL 생성",
     "sql_validator": "생성된 SQL 안전성 및 구문 검증",
     "run_query": "Databricks에서 SQL 실행",
     "visualization": "쿼리 결과를 이용한 시각화 코드 작성",
+    "table_results": "각 테이블 결과/시각화 누적",
     "response": "최종 답변/요약 작성",
     "clarify": "정보가 부족할 때 추가 질문",
     "error": "쿼리 실패 등 오류 안내",
@@ -46,7 +50,9 @@ LANGGRAPH_DOT = """
 digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
-    extract_user -> intent;
+    extract_user -> prepare_tables -> intent;
+    intent -> table_select [label="multi-table"];
+    table_select -> table_sql -> run_query;
     intent -> sql_generator [label="visualize/sql"];
     intent -> clarify [label="clarify"];
     intent -> response [label="simple"];
@@ -55,9 +61,13 @@ digraph {
     sql_validator -> run_query [label="pass"];
     sql_validator -> error [label="max fail"];
     run_query -> visualization [label="visualize"];
+    run_query -> table_results [label="multi-table"];
     run_query -> response [label="sql only"];
     run_query -> error [label="error"];
+    visualization -> table_results [label="multi-table"];
     visualization -> response;
+    table_results -> table_select [label="next"];
+    table_results -> response [label="done"];
     clarify -> end;
     response -> end;
     error -> end;

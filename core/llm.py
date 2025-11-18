@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Literal, TypedDict
 
 try:
@@ -34,6 +36,11 @@ AgentIntent = Literal["visualize", "sql_query", "simple_answer", "clarify"]
 class AgentState(TypedDict, total=False):
     messages: List[ChatMessage]
     table_metadata: Dict[str, Any]
+    table_sequence: List[str]
+    table_queue: List[str]
+    current_table: str
+    table_outputs: List[Dict[str, Any]]
+    visualization_blocks: List[str]
     user_query: str
     intent: AgentIntent
     sql_query: str
@@ -78,6 +85,79 @@ def _format_metadata(table_metadata: Dict[str, Any] | None) -> str:
         qualified = full_name or table_name
         lines.append(f"{qualified}: {column_text}")
     return "\n".join(lines)
+
+
+def _safe_json_dumps(value: Any) -> str:
+    def _default(obj: Any) -> Any:
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return str(obj)
+
+    return json.dumps(value, ensure_ascii=False, default=_default)
+
+
+MULTI_TABLE_KEYWORDS = (
+    "모든 테이블",
+    "전체 테이블",
+    "각 테이블",
+    "순차적으로",
+    "순차",
+    "all tables",
+    "each table",
+    "sequential tables",
+)
+MULTI_TABLE_SAMPLE_LIMIT = 200
+MAX_MULTI_TABLES = 5
+
+
+def _requests_all_tables(query: str) -> bool:
+    normalized = (query or "").lower()
+    return any(keyword in normalized for keyword in MULTI_TABLE_KEYWORDS)
+
+
+def _resolve_table_sequence(
+    requested: List[str] | None,
+    query: str,
+    table_metadata: Dict[str, Any] | None,
+) -> List[str]:
+    if not table_metadata:
+        return []
+    normalized_map = {name.lower(): name for name in table_metadata}
+
+    def _dedup(names: List[str]) -> List[str]:
+        seen = set()
+        ordered: List[str] = []
+        for name in names:
+            actual = normalized_map.get(name.lower())
+            if actual and actual not in seen:
+                seen.add(actual)
+                ordered.append(actual)
+        return ordered
+
+    if requested:
+        return _dedup(requested)[:MAX_MULTI_TABLES]
+
+    normalized_query = (query or "").lower()
+    hits = []
+    for lowered, actual in normalized_map.items():
+        index = normalized_query.find(lowered)
+        if index != -1:
+            hits.append((index, actual))
+    if hits:
+        hits.sort()
+        return [name for _, name in hits][:MAX_MULTI_TABLES]
+    if _requests_all_tables(normalized_query):
+        return list(table_metadata.keys())[:MAX_MULTI_TABLES]
+    return []
+
+
+def _table_full_name(table_name: str, metadata: Dict[str, Any] | None) -> str:
+    full_name = (metadata or {}).get("full_name")
+    if full_name:
+        return full_name
+    return table_name
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
@@ -260,6 +340,18 @@ def build_conversation_graph(provider: str | None = None):
         query = _latest_user_query(state.get("messages", []))
         return with_path(state, "extract_user", {"user_query": query})
 
+    def prepare_table_sequence(state: AgentState) -> AgentState:
+        query = state.get("user_query", "")
+        metadata = state.get("table_metadata") or {}
+        requested = state.get("table_sequence")
+        sequence = _resolve_table_sequence(requested, query, metadata)
+        updates: AgentState = {
+            "table_queue": sequence,
+            "table_outputs": [],
+            "visualization_blocks": [],
+        }
+        return with_path(state, "prepare_tables", updates)
+
     def classify_intent(state: AgentState) -> AgentState:
         query = state.get("user_query", "")
         if not query:
@@ -309,6 +401,34 @@ def build_conversation_graph(provider: str | None = None):
         sql = _strip_code_block(raw_sql)
         return with_path(state, "sql_generator", {"sql_query": sql})
 
+    def select_next_table(state: AgentState) -> AgentState:
+        queue = list(state.get("table_queue") or [])
+        updates: AgentState = {}
+        if not queue:
+            updates["current_table"] = ""
+            return with_path(state, "table_select", updates)
+        current = queue.pop(0)
+        updates["current_table"] = current
+        updates["table_queue"] = queue
+        updates["sql_query"] = ""
+        updates["sql_validation_error"] = ""
+        updates["sql_retry_count"] = 0
+        return with_path(state, "table_select", updates)
+
+    def build_table_sql(state: AgentState) -> AgentState:
+        table_name = state.get("current_table")
+        if not table_name:
+            return with_path(
+                state, "table_sql", {"error_message": "순차적으로 조회할 테이블이 없습니다."}
+            )
+        metadata = (state.get("table_metadata") or {}).get(table_name, {})
+        limit = metadata.get("preview_limit") or MULTI_TABLE_SAMPLE_LIMIT
+        if not isinstance(limit, int) or limit <= 0:
+            limit = MULTI_TABLE_SAMPLE_LIMIT
+        full_name = _table_full_name(table_name, metadata)
+        statement = f"SELECT * FROM {full_name} LIMIT {limit}"
+        return with_path(state, "table_sql", {"sql_query": statement})
+
     def validate_sql(state: AgentState) -> AgentState:
         statement = state.get("sql_query", "")
         validation_error = _validate_sql_statement(statement)
@@ -339,7 +459,7 @@ def build_conversation_graph(provider: str | None = None):
     def plan_visualization(state: AgentState) -> AgentState:
         rows = state.get("query_result", []) or []
         sample = rows[:50]
-        data_json = json.dumps(sample, ensure_ascii=False)
+        data_json = _safe_json_dumps(sample)
         user_query = state.get("user_query", "")
         system_prompt = (
             "You create Matplotlib visualization code for tabular data. "
@@ -347,8 +467,10 @@ def build_conversation_graph(provider: str | None = None):
             "from the provided rows. Close with plt.tight_layout(). "
             "Return only a Python code block."
         )
+        table_name = state.get("current_table")
+        table_context = f"Current table: {table_name}\n" if table_name else ""
         user_prompt = (
-            f"User request:\n{user_query}\n\nRows JSON:\n{data_json}\n\n"
+            f"{table_context}User request:\n{user_query}\n\nRows JSON:\n{data_json}\n\n"
             "Generate concise visualization code."
         )
         code = _call_llm(selected, system_prompt, user_prompt).strip()
@@ -357,27 +479,47 @@ def build_conversation_graph(provider: str | None = None):
         return with_path(state, "visualization", {"visualization_code": code})
 
     def respond(state: AgentState) -> AgentState:
-        rows = state.get("query_result", []) or []
-        sample = rows[:20]
-        data_json = json.dumps(sample, ensure_ascii=False)
-        sql_query = state.get("sql_query", "")
         intent = state.get("intent", "simple_answer")
         user_query = state.get("user_query", "")
-        system_prompt = (
-            "You are a helpful analytics assistant. Summarize query results clearly. "
-            "If no data is available, respond conversationally using general knowledge."
-        )
-        user_prompt = (
-            f"Intent: {intent}\nUser query: {user_query}\n"
-            f"SQL: {sql_query or 'N/A'}\nData preview JSON:\n{data_json}\n\n"
-            "Write the final response in Korean, summarizing insights. "
-            "Mention charts if visualization code is provided."
-        )
-        reply = _call_llm(selected, system_prompt, user_prompt).strip()
-        visualization_code = state.get("visualization_code")
-        final_text = reply
-        if visualization_code:
-            final_text = f"{reply}\n\n{visualization_code}"
+        table_outputs = state.get("table_outputs") or []
+        visualization_blocks = state.get("visualization_blocks") or []
+        if table_outputs:
+            previews_json = _safe_json_dumps(table_outputs)
+            system_prompt = (
+                "You review sequential table previews. Summarize each table in order, "
+                "highlighting row counts and notable columns. Keep the tone concise and "
+                "respond in Korean."
+            )
+            user_prompt = (
+                f"User query: {user_query}\nIntent: {intent}\n"
+                f"Table previews JSON:\n{previews_json}\n\n"
+                "Write sectioned summaries (one per table)."
+            )
+            reply = _call_llm(selected, system_prompt, user_prompt).strip()
+            final_text = reply
+            if visualization_blocks:
+                blocks = "\n\n".join(visualization_blocks)
+                final_text = f"{reply}\n\n{blocks}"
+        else:
+            rows = state.get("query_result", []) or []
+            sample = rows[:20]
+            data_json = _safe_json_dumps(sample)
+            sql_query = state.get("sql_query", "")
+            system_prompt = (
+                "You are a helpful analytics assistant. Summarize query results clearly. "
+                "If no data is available, respond conversationally using general knowledge."
+            )
+            user_prompt = (
+                f"Intent: {intent}\nUser query: {user_query}\n"
+                f"SQL: {sql_query or 'N/A'}\nData preview JSON:\n{data_json}\n\n"
+                "Write the final response in Korean, summarizing insights. "
+                "Mention charts if visualization code is provided."
+            )
+            reply = _call_llm(selected, system_prompt, user_prompt).strip()
+            final_text = reply
+            visualization_code = state.get("visualization_code")
+            if visualization_code:
+                final_text = f"{reply}\n\n{visualization_code}"
         response_path = list(state.get("node_path", [])) + ["response"]
         final_text = f"{final_text}{_node_path_diagram(response_path)}"
         messages = state.get("messages", [])
@@ -428,7 +570,36 @@ def build_conversation_graph(provider: str | None = None):
             },
         )
 
+    def collect_table_results(state: AgentState) -> AgentState:
+        table_name = state.get("current_table", "")
+        rows = state.get("query_result", []) or []
+        visualization_code = state.get("visualization_code", "")
+        outputs = list(state.get("table_outputs") or [])
+        if table_name:
+            entry = {
+                "table": table_name,
+                "sql": state.get("sql_query", ""),
+                "row_count": len(rows),
+                "rows": rows[:20],
+            }
+            outputs.append(entry)
+        viz_blocks = list(state.get("visualization_blocks") or [])
+        if visualization_code:
+            labeled_code = visualization_code
+            if table_name:
+                labeled_code = f"**{table_name}** 테이블 시각화\n\n{visualization_code}"
+            viz_blocks.append(labeled_code)
+        updates: AgentState = {
+            "table_outputs": outputs,
+            "visualization_blocks": viz_blocks,
+            "visualization_code": "",
+            "current_table": "",
+        }
+        return with_path(state, "table_results", updates)
+
     def route_intent(state: AgentState) -> str:
+        if state.get("table_queue"):
+            return "table_select"
         intent = state.get("intent", "simple_answer")
         if intent in {"visualize", "sql_query"}:
             return "sql_generator"
@@ -446,22 +617,41 @@ def build_conversation_graph(provider: str | None = None):
     def route_query(state: AgentState) -> str:
         if state.get("error_message"):
             return "error"
+        if state.get("current_table"):
+            if state.get("query_result"):
+                return "visualization"
+            return "table_results"
         if state.get("intent") == "visualize" and state.get("query_result"):
             return "visualization"
         return "response"
 
+    def route_visualization_next(state: AgentState) -> str:
+        if state.get("current_table"):
+            return "table_results"
+        return "response"
+
+    def route_table_progress(state: AgentState) -> str:
+        if state.get("table_queue"):
+            return "table_select"
+        return "response"
+
     workflow.add_node("extract_user", extract_user_query)
+    workflow.add_node("prepare_tables", prepare_table_sequence)
     workflow.add_node("intent", classify_intent)
+    workflow.add_node("table_select", select_next_table)
+    workflow.add_node("table_sql", build_table_sql)
     workflow.add_node("sql_generator", generate_sql)
     workflow.add_node("sql_validator", validate_sql)
     workflow.add_node("run_query", execute_sql)
     workflow.add_node("visualization", plan_visualization)
+    workflow.add_node("table_results", collect_table_results)
     workflow.add_node("response", respond)
     workflow.add_node("clarify", clarify)
     workflow.add_node("error", handle_error)
 
     workflow.set_entry_point("extract_user")
-    workflow.add_edge("extract_user", "intent")
+    workflow.add_edge("extract_user", "prepare_tables")
+    workflow.add_edge("prepare_tables", "intent")
     workflow.add_conditional_edges(
         "intent",
         route_intent,
@@ -469,8 +659,11 @@ def build_conversation_graph(provider: str | None = None):
             "sql_generator": "sql_generator",
             "clarify": "clarify",
             "response": "response",
+            "table_select": "table_select",
         },
     )
+    workflow.add_edge("table_select", "table_sql")
+    workflow.add_edge("table_sql", "run_query")
     workflow.add_edge("sql_generator", "sql_validator")
     workflow.add_conditional_edges(
         "sql_validator",
@@ -485,12 +678,28 @@ def build_conversation_graph(provider: str | None = None):
         "run_query",
         route_query,
         {
+            "table_results": "table_results",
             "visualization": "visualization",
             "response": "response",
             "error": "error",
         },
     )
-    workflow.add_edge("visualization", "response")
+    workflow.add_conditional_edges(
+        "visualization",
+        route_visualization_next,
+        {
+            "table_results": "table_results",
+            "response": "response",
+        },
+    )
+    workflow.add_conditional_edges(
+        "table_results",
+        route_table_progress,
+        {
+            "table_select": "table_select",
+            "response": "response",
+        },
+    )
     workflow.add_edge("clarify", END)
     workflow.add_edge("response", END)
     workflow.add_edge("error", END)
