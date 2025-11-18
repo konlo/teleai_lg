@@ -65,14 +65,18 @@ digraph {
 """
 
 
-def _match_table_reference(prompt: str, candidates: Iterable[str]) -> str | None:
-    """Return first table whose name appears in the prompt (case-insensitive)."""
+def _find_table_references(prompt: str, candidates: Iterable[str]) -> List[str]:
+    """Return all candidate tables mentioned in the prompt (case-insensitive)."""
+
     normalized_prompt = prompt.lower()
+    matches: List[Tuple[int, str]] = []
     for table in candidates:
         pattern = re.compile(rf"(?<!\w){re.escape(table.lower())}(?!\w)")
-        if pattern.search(normalized_prompt):
-            return table
-    return None
+        match = pattern.search(normalized_prompt)
+        if match:
+            matches.append((match.start(), table))
+    matches.sort(key=lambda item: item[0])
+    return [table for _pos, table in matches]
 
 
 def _extract_code_blocks(text: str) -> List[str]:
@@ -317,16 +321,20 @@ def main() -> None:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        table_name = None
-        table_match = TABLE_LOAD_PATTERN.search(prompt)
-        if table_match:
-            table_name = table_match.group("table")
+        table_names: List[str] = []
+        table_matches = [match.group("table") for match in TABLE_LOAD_PATTERN.finditer(prompt)]
+        if table_matches:
+            table_names = table_matches
         elif tables := st.session_state.get("tables"):
-            table_name = _match_table_reference(prompt, tables)
+            table_names = _find_table_references(prompt, tables)
+
+        if table_names:
+            seen: set[str] = set()
+            table_names = [name for name in table_names if not (name in seen or seen.add(name))]
 
         with st.chat_message("assistant"):
             assistant_segments: List[str] = []
-            if table_name:
+            for table_name in table_names:
                 try:
                     sql_statement, rows = fetch_table_preview(
                         table_name, limit=TABLE_PREVIEW_LIMIT
