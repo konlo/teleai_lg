@@ -41,6 +41,7 @@ LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
     "prepare_tables": "질문/스키마에서 순차 처리 테이블 선정",
     "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
+    "s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
     "table_select": "다음 테이블 선택 및 상태 업데이트",
     "table_sql": "선택된 테이블용 안전한 SQL 생성",
     "sql_generator": "스키마를 참고해 SQL 생성",
@@ -59,7 +60,8 @@ digraph {
     extract_user -> prepare_tables -> intent;
     intent -> table_select [label="multi-table"];
     table_select -> table_sql -> run_query;
-    intent -> sql_generator [label="visualize/sql"];
+    intent -> s2w_tool [label="visualize/sql"];
+    s2w_tool -> sql_generator;
     intent -> clarify [label="clarify"];
     intent -> response [label="simple"];
     sql_generator -> sql_validator;
