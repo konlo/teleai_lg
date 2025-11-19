@@ -21,6 +21,12 @@ load_dotenv()
 
 
 SYSTEM_PROMPT = "You are a helpful assistant who keeps answers concise and clear."
+# To avoid exceeding provider context limits we only send the most recent
+# portion of the conversation to the LLM. These limits are intentionally
+# conservative because downstream prompts also include table previews and
+# visualization code.
+MAX_HISTORY_MESSAGES = 12
+MAX_MESSAGE_CHARS = 4000
 TABLE_PREVIEW_LIMIT = 50
 TABLE_LOAD_PATTERN = re.compile(
     r"(?P<table>[A-Za-z0-9_]+)\s+table\s+(?:데이터|데이타)\s*로딩(?:해줘|해줘요|해줘라|해줘봐|해줄래|해줄수있어|해|줘)?",
@@ -231,11 +237,22 @@ def _render_node_flow(message_index: int) -> None:
     st.graphviz_chart("\n".join(lines))
 
 
+def _truncate_message_content(content: str) -> str:
+    """Trim very long message text while indicating truncation."""
+
+    if len(content) <= MAX_MESSAGE_CHARS:
+        return content
+    notice = "(이전 대화 일부는 길이 제한으로 생략되었습니다.)\n"
+    return f"{notice}{content[-MAX_MESSAGE_CHARS:]}"
+
+
 def _lc_messages(history: List[Tuple[str, str]]) -> List[ChatMessage]:
     """Convert (role, content) tuples to LangGraph-compatible message dicts."""
+
     messages: List[ChatMessage] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for role, content in history:
-        messages.append({"role": role, "content": content})
+    recent_history = history[-MAX_HISTORY_MESSAGES:]
+    for role, content in recent_history:
+        messages.append({"role": role, "content": _truncate_message_content(content)})
     return messages
 
 
