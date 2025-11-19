@@ -42,10 +42,14 @@ class AgentState(TypedDict, total=False):
     table_outputs: List[Dict[str, Any]]
     visualization_blocks: List[str]
     user_query: str
+    clean_user_query: str
     intent: AgentIntent
     sql_query: str
     sql_validation_error: str
     sql_retry_count: int
+    sql_limit: int
+    sql_tool_description: str
+    sql_tool_active: bool
     query_result: List[Dict[str, Any]]
     visualization_code: str
     response: str
@@ -164,6 +168,8 @@ _CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
 SQL_DANGER_PATTERN = re.compile(r"(?i)\b(drop|delete|alter|update|insert|merge|truncate)\b")
 SQL_SELECT_PATTERN = re.compile(r"(?i)\bselect\b")
 SQL_VALIDATION_MAX_RETRIES = 2
+DEFAULT_SQL_LIMIT = 500
+MAX_LIMIT_OVERRIDE = 2000
 
 
 def _strip_code_block(text: str) -> str:
@@ -221,7 +227,12 @@ def _count_select_columns(statement: str) -> int:
     return len([col for col in columns if col])
 
 
-def _validate_sql_statement(statement: str) -> str | None:
+def _validate_sql_statement(
+    statement: str,
+    max_limit: int | None = None,
+    *,
+    require_where: bool = False,
+) -> str | None:
     normalized = statement.strip()
     if not normalized:
         return "SQL 문장이 비어 있습니다."
@@ -244,7 +255,43 @@ def _validate_sql_statement(statement: str) -> str | None:
         numbers = [int(token) for token in re.findall(r"\d+", order_match.group(1))]
         if numbers and max(numbers) > column_count:
             return "ORDER BY 인덱스가 SELECT 항목 수를 초과합니다."
+    if require_where and "where 1=1" not in normalized.lower():
+        return "기본 필터로 WHERE 1=1 절을 포함해 주세요."
+    if max_limit:
+        limit_match = re.search(r"(?i)limit\s+(\d+)", normalized)
+        if not limit_match:
+            return f"LIMIT 절을 포함하고 값을 {max_limit} 이하로 설정해 주세요."
+        limit_value = int(limit_match.group(1))
+        if limit_value > max_limit:
+            return f"LIMIT 값은 {max_limit} 이하로 설정해야 합니다."
     return None
+
+
+def _determine_sql_limit(query: str) -> int:
+    override_match = re.search(r"%limit\s+(\d+)", query or "", re.IGNORECASE)
+    if override_match:
+        candidate = int(override_match.group(1))
+        return min(candidate, MAX_LIMIT_OVERRIDE)
+    return DEFAULT_SQL_LIMIT
+
+
+def _s2w_tool_description(limit: int, metadata: str) -> str:
+    clauses = [
+        "Tool name: s2w (Safe-to-Visualize SQL Writer).",
+        "Purpose: build Databricks SQL optimized for visualization while staying read-only.",
+        "Guidance:",
+        "- Always start filters with `WHERE 1=1` even when no additional conditions exist.",
+        "- Wrap every table identifier in backticks and keep the fully-qualified names from the schema section.",
+        "- Select only the columns required for the requested chart; avoid `SELECT *`.",
+        "- Apply an explicit LIMIT and keep it at or below the requested bound.",
+        "- Keep the statement single-query and free of DDL/DML.",
+    ]
+    return (
+        "\n".join(clauses)
+        + "\n\nTable schemas (for backticked names):\n"
+        + metadata
+        + f"\n\nDefault LIMIT: {limit} (override only when `%limit <value>` is provided, up to {MAX_LIMIT_OVERRIDE})."
+    )
 
 
 def _openai_response(messages: List[ChatMessage]) -> str:
@@ -338,7 +385,18 @@ def build_conversation_graph(provider: str | None = None):
 
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
-        return with_path(state, "extract_user", {"user_query": query})
+        cleaned_query = re.sub(r"%limit\s+\d+", "", query or "", flags=re.IGNORECASE).strip()
+        limit = _determine_sql_limit(query)
+        return with_path(
+            state,
+            "extract_user",
+            {
+                "user_query": query,
+                "clean_user_query": cleaned_query,
+                "sql_limit": limit,
+                "sql_tool_active": False,
+            },
+        )
 
     def prepare_table_sequence(state: AgentState) -> AgentState:
         query = state.get("user_query", "")
@@ -374,21 +432,35 @@ def build_conversation_graph(provider: str | None = None):
             intent = "simple_answer"
         return with_path(state, "intent", {"intent": intent})
 
+    def prepare_sql_tool_context(state: AgentState) -> AgentState:
+        metadata_text = _format_metadata(state.get("table_metadata"))
+        limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
+        tool_description = _s2w_tool_description(limit, metadata_text)
+        return with_path(
+            state,
+            "s2w_tool",
+            {
+                "sql_tool_description": tool_description,
+                "sql_tool_active": True,
+            },
+        )
+
     def generate_sql(state: AgentState) -> AgentState:
-        query = state.get("user_query", "")
+        query = state.get("clean_user_query") or state.get("user_query", "")
         metadata = _format_metadata(state.get("table_metadata"))
         feedback = state.get("sql_validation_error")
         retry_count = state.get("sql_retry_count", 0)
-        system_prompt = (
-            "You are a Databricks SQL expert. Generate safe SQL answers that only read data. "
-            "Always include an explicit LIMIT <= 500 if the query might return many rows. "
-            "Table schemas below show fully-qualified names already wrapped in backticks. "
-            "When referencing those tables, copy the entire qualified name verbatim."
-        )
+        limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
+        system_prompt = _s2w_tool_description(limit, metadata)
+        tool_details = state.get("sql_tool_description")
+        if tool_details:
+            system_prompt = tool_details
         user_prompt = (
             f"Schema information:\n{metadata}\n\nUser request:\n{query}\n\n"
             "Return only the SQL query."
         )
+        if limit:
+            user_prompt += f"\nUse an explicit LIMIT no higher than {limit}."
         if feedback:
             user_prompt += (
                 "\n\nA previous attempt failed automatic validation for this reason:\n"
@@ -413,6 +485,7 @@ def build_conversation_graph(provider: str | None = None):
         updates["sql_query"] = ""
         updates["sql_validation_error"] = ""
         updates["sql_retry_count"] = 0
+        updates["sql_tool_active"] = False
         return with_path(state, "table_select", updates)
 
     def build_table_sql(state: AgentState) -> AgentState:
@@ -431,7 +504,11 @@ def build_conversation_graph(provider: str | None = None):
 
     def validate_sql(state: AgentState) -> AgentState:
         statement = state.get("sql_query", "")
-        validation_error = _validate_sql_statement(statement)
+        max_limit = state.get("sql_limit") if state.get("sql_tool_active") else None
+        require_where = bool(state.get("sql_tool_active"))
+        validation_error = _validate_sql_statement(
+            statement, max_limit=max_limit, require_where=require_where
+        )
         retries = state.get("sql_retry_count", 0)
         updates: AgentState = {}
         if validation_error:
@@ -605,7 +682,7 @@ def build_conversation_graph(provider: str | None = None):
             return "table_select"
         intent = state.get("intent", "simple_answer")
         if intent in {"visualize", "sql_query"}:
-            return "sql_generator"
+            return "s2w_tool"
         if intent == "clarify":
             return "clarify"
         return "response"
@@ -641,6 +718,7 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("prepare_tables", prepare_table_sequence)
     workflow.add_node("intent", classify_intent)
+    workflow.add_node("s2w_tool", prepare_sql_tool_context)
     workflow.add_node("table_select", select_next_table)
     workflow.add_node("table_sql", build_table_sql)
     workflow.add_node("sql_generator", generate_sql)
@@ -659,12 +737,13 @@ def build_conversation_graph(provider: str | None = None):
         "intent",
         route_intent,
         {
-            "sql_generator": "sql_generator",
+            "sql_generator": "s2w_tool",
             "clarify": "clarify",
             "response": "response",
             "table_select": "table_select",
         },
     )
+    workflow.add_edge("s2w_tool", "sql_generator")
     workflow.add_edge("table_select", "table_sql")
     workflow.add_edge("table_sql", "run_query")
     workflow.add_edge("sql_generator", "sql_validator")
