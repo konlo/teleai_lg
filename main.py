@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import json
 from typing import Any, Dict, Iterable, List, Tuple
 
 import streamlit as st
@@ -15,7 +16,12 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         return None
 
 from core.databricks import fetch_table_metadata, fetch_table_preview, list_tables
-from core.llm import ChatMessage, DEFAULT_SQL_LIMIT, build_conversation_graph
+from core.llm import (
+    ChatMessage,
+    DEFAULT_SQL_LIMIT,
+    MAX_LIMIT_OVERRIDE,
+    build_conversation_graph,
+)
 
 load_dotenv()
 
@@ -32,7 +38,8 @@ TABLE_LOAD_PATTERN = re.compile(
     r"(?P<table>[A-Za-z0-9_]+)\s+table\s+(?:데이터|데이타)\s*로딩(?:해줘|해줘요|해줘라|해줘봐|해줄래|해줄수있어|해|줘)?",
     re.IGNORECASE,
 )
-CODE_BLOCK_PATTERN = re.compile(r"```(?:python)?\s*([\s\S]+?)```", re.IGNORECASE)
+LIMIT_DIRECTIVE_PATTERN = re.compile(r"%limit\s+(\d+)", re.IGNORECASE)
+CODE_BLOCK_PATTERN = re.compile(r"```(?P<lang>\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
 # Replace JSON-style literals with Python equivalents when the LLM emits
 # visualization code snippets. This avoids NameError when the model returns
 # data samples containing null/true/false.
@@ -58,9 +65,8 @@ digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
     extract_user -> intent;
-    intent -> configure_limits [label="visualize/sql"];
+    intent -> configure_limits [label="%limit"];
     configure_limits -> response [label="%limit only"];
-    configure_limits -> intent;
     intent -> table_select [label="multi-table"];
     table_select -> table_sql -> run_query;
     intent -> s2w_tool [label="visualize/sql ready"];
@@ -100,9 +106,24 @@ def _find_table_references(prompt: str, candidates: Iterable[str]) -> List[str]:
     return [table for _pos, table in matches]
 
 
-def _extract_code_blocks(text: str) -> List[str]:
-    """Return fenced python code blocks from text."""
-    return [match.group(1).strip() for match in CODE_BLOCK_PATTERN.finditer(text)]
+def _extract_code_blocks(text: str) -> List[Tuple[str, str]]:
+    """Return fenced code blocks and their language labels."""
+
+    blocks: List[Tuple[str, str]] = []
+    for match in CODE_BLOCK_PATTERN.finditer(text):
+        lang = (match.group("lang") or "").strip().lower()
+        code = match.group(2).strip()
+        blocks.append((lang, code))
+    return blocks
+
+
+def _looks_like_json(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return (stripped.startswith("{") and stripped.endswith("}")) or (
+        stripped.startswith("[") and stripped.endswith("]")
+    )
 
 
 def _normalize_json_literals(code: str) -> str:
@@ -186,11 +207,36 @@ def _handle_visualization_blocks(text: str) -> None:
     if not code_blocks:
         return
     message_index = len(st.session_state.history) - 1
-    for idx, code in enumerate(code_blocks, start=1):
-        if _is_graphviz_code(code):
+    for idx, (lang, code) in enumerate(code_blocks, start=1):
+        lang_lower = lang or ""
+        lang_lower = lang_lower.lower()
+        if lang_lower in {"dot", "graphviz"} or _is_graphviz_code(code):
             st.graphviz_chart(code)
             _append_visualization_message(
                 message_index, "info", f"Code block {idx} Graphviz 렌더링 완료.")
+            continue
+        if lang_lower == "json" or _looks_like_json(code):
+            st.code(code, language="json")
+            _append_visualization_message(
+                message_index,
+                "info",
+                f"Code block {idx}은 JSON 정보 블록이라 실행하지 않았어요.",
+            )
+            continue
+        if lang_lower and lang_lower != "python":
+            _append_visualization_message(
+                message_index,
+                "warning",
+                f"Code block {idx}은 지원되지 않는 언어({lang})라 실행하지 않았어요.",
+            )
+            continue
+        if not lang_lower:
+            st.code(code)
+            _append_visualization_message(
+                message_index,
+                "info",
+                f"Code block {idx}은 언어 미지정 블록이라 실행하지 않았어요.",
+            )
             continue
         try:
             images = _execute_visualization_code(code)
@@ -354,6 +400,12 @@ def main() -> None:
         st.session_state.history.append(("user", prompt))
         with st.chat_message("user"):
             st.markdown(prompt)
+
+        limit_override_match = LIMIT_DIRECTIVE_PATTERN.search(prompt)
+        if limit_override_match:
+            limit_value = int(limit_override_match.group(1))
+            limit_value = min(limit_value, MAX_LIMIT_OVERRIDE)
+            st.session_state.sql_limit = limit_value
 
         table_names: List[str] = []
         table_matches = [match.group("table") for match in TABLE_LOAD_PATTERN.finditer(prompt)]

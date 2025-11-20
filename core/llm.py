@@ -6,7 +6,15 @@ import os
 import re
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Literal, TypedDict
+from typing import Any, Dict, List, Literal, Tuple, TypedDict, Type, TypeVar
+
+try:
+    from pydantic import BaseModel, Field
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    BaseModel = object
+
+    def Field(*_args, **_kwargs):
+        return None
 
 try:
     from dotenv import load_dotenv
@@ -55,6 +63,7 @@ class AgentState(TypedDict, total=False):
     response: str
     error_message: str
     node_path: List[str]
+    node_traces: List[Dict[str, Any]]
 
 
 def _ensure_key(var_name: str, provider_label: str) -> str:
@@ -71,6 +80,35 @@ def _call_llm(provider: str, system_prompt: str, user_prompt: str) -> str:
     ]
     reply = _invoke_provider(messages, provider)
     return reply["content"]
+
+
+TModel = TypeVar("TModel", bound=BaseModel)
+
+
+def _call_structured_llm(
+    provider: str,
+    system_prompt: str,
+    user_prompt: str,
+    model_cls: Type[TModel],
+) -> TModel:
+    """Request a JSON response matching the supplied Pydantic schema."""
+
+    schema_getter = getattr(model_cls, "model_json_schema", None)
+    validator = getattr(model_cls, "model_validate_json", None)
+    if not callable(schema_getter) or not callable(validator):
+        raise RuntimeError("Structured responses require Pydantic to be installed.")
+    schema = schema_getter()
+    augmented_system = (
+        system_prompt.strip()
+        + "\n\nRespond with a JSON object that matches this schema:\n"
+        + json.dumps(schema, indent=2)
+    )
+    messages: List[ChatMessage] = [
+        {"role": "system", "content": augmented_system},
+        {"role": "user", "content": user_prompt.strip()},
+    ]
+    response = _invoke_provider(messages, provider, json_mode=True)
+    return validator(response["content"])
 
 
 def _format_metadata(table_metadata: Dict[str, Any] | None) -> str:
@@ -100,6 +138,86 @@ def _safe_json_dumps(value: Any) -> str:
         return str(obj)
 
     return json.dumps(value, ensure_ascii=False, default=_default)
+
+
+def _debug_snapshot(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe copy of the state or update payload for tracing."""
+
+    sanitized = {key: value for key, value in data.items() if key != "node_traces"}
+    try:
+        return json.loads(_safe_json_dumps(sanitized))
+    except Exception:
+        return {key: str(value) for key, value in sanitized.items()}
+
+
+def _append_node_trace(
+    state: AgentState,
+    node_name: str,
+    updates: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    traces = list(state.get("node_traces") or [])
+    input_snapshot = _debug_snapshot(state)
+    output_snapshot = _debug_snapshot(updates)
+    merged_state = _debug_snapshot({**input_snapshot, **output_snapshot})
+    traces.append(
+        {
+            "node": node_name,
+            "input": input_snapshot,
+            "output": output_snapshot,
+            "state": merged_state,
+        }
+    )
+    return traces, input_snapshot, output_snapshot, merged_state
+
+
+def _log_node_io(
+    node_name: str,
+    input_snapshot: Dict[str, Any],
+    output_snapshot: Dict[str, Any],
+    merged_state: Dict[str, Any],
+) -> None:
+    try:
+        input_json = _safe_json_dumps(input_snapshot)
+    except Exception:
+        input_json = str(input_snapshot)
+    try:
+        output_json = _safe_json_dumps(output_snapshot)
+    except Exception:
+        output_json = str(output_snapshot)
+    try:
+        state_json = _safe_json_dumps(merged_state)
+    except Exception:
+        state_json = str(merged_state)
+    print(
+        f"\n[{node_name}] 입력:\n{input_json}\n"
+        f"[{node_name}] 출력:\n{output_json}\n"
+        f"[{node_name}] 상태:\n{state_json}\n"
+    )
+
+
+def _format_node_traces(traces: List[Dict[str, Any]] | None) -> str:
+    if not traces:
+        return ""
+    segments: List[str] = ["\n\n노드 입출력 기록"]
+    for trace in traces:
+        node_name = trace.get("node", "unknown")
+        segments.append(f"\n[{node_name}] 입력:")
+        input_payload = _safe_json_dumps(trace.get("input", {}))
+        segments.append(f"```json\n{input_payload}\n```")
+        segments.append(f"[{node_name}] 출력:")
+        output_payload = _safe_json_dumps(trace.get("output", {}))
+        segments.append(f"```json\n{output_payload}\n```")
+        state_payload = _safe_json_dumps(trace.get("state", {}))
+        segments.append(f"[{node_name}] 상태:")
+        segments.append(f"```json\n{state_payload}\n```")
+    return "\n".join(segments)
+
+
+def _append_trace_text(text: str, state: AgentState) -> str:
+    trace_text = _format_node_traces(state.get("node_traces"))
+    if not trace_text:
+        return text
+    return f"{text}{trace_text}"
 
 
 MULTI_TABLE_KEYWORDS = (
@@ -257,7 +375,9 @@ def _validate_sql_statement(
         if numbers and max(numbers) > column_count:
             return "ORDER BY 인덱스가 SELECT 항목 수를 초과합니다."
     if require_where and "where 1=1" not in normalized.lower():
-        return "기본 필터로 WHERE 1=1 절을 포함해 주세요."
+        # Using a regex for more flexible matching of "WHERE 1=1" or equivalent safe conditions.
+        if not re.search(r"where\s+1\s*=\s*1", normalized.lower()):
+            return "기본 필터로 WHERE 1=1 절을 포함해 주세요."
     if max_limit:
         limit_match = re.search(r"(?i)limit\s+(\d+)", normalized)
         if not limit_match:
@@ -298,13 +418,18 @@ def _s2w_tool_description(limit: int, metadata: str) -> str:
     )
 
 
-def _openai_response(messages: List[ChatMessage]) -> str:
+def _openai_response(messages: List[ChatMessage], json_mode: bool = False) -> str:
     from openai import OpenAI
 
     api_key = _ensure_key("OPENAI_API_KEY", "OpenAI")
     client = OpenAI(api_key=api_key)
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    kwargs = {}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
     completion = client.chat.completions.create(
+        **kwargs,
         model=model,
         messages=[{"role": msg["role"], "content": msg["content"]} for msg in messages],
         temperature=0.3,
@@ -312,7 +437,7 @@ def _openai_response(messages: List[ChatMessage]) -> str:
     return completion.choices[0].message.content or ""
 
 
-def _azure_response(messages: List[ChatMessage]) -> str:
+def _azure_response(messages: List[ChatMessage], json_mode: bool = False) -> str:
     from openai import AzureOpenAI
 
     api_key = _ensure_key("AZURE_OPENAI_API_KEY", "Azure OpenAI")
@@ -324,7 +449,12 @@ def _azure_response(messages: List[ChatMessage]) -> str:
         api_version=api_version,
         azure_endpoint=endpoint,
     )
+    kwargs = {}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
     completion = client.chat.completions.create(
+        **kwargs,
         model=deployment,
         messages=[{"role": msg["role"], "content": msg["content"]} for msg in messages],
         temperature=0.3,
@@ -332,7 +462,7 @@ def _azure_response(messages: List[ChatMessage]) -> str:
     return completion.choices[0].message.content or ""
 
 
-def _google_response(messages: List[ChatMessage]) -> str:
+def _google_response(messages: List[ChatMessage], json_mode: bool = False) -> str:
     import google.generativeai as genai
 
     api_key = _ensure_key("GOOGLE_API_KEY", "Google Gemini")
@@ -347,7 +477,12 @@ def _google_response(messages: List[ChatMessage]) -> str:
         role = "user" if msg["role"] == "user" else "model"
         conversation.append({"role": role, "parts": [msg["content"]]})
 
+    generation_config = {}
+    if json_mode:
+        generation_config["response_mime_type"] = "application/json"
+
     model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+    model.generation_config = generation_config
     response = model.generate_content(conversation)
     if hasattr(response, "text") and response.text:
         return response.text
@@ -359,13 +494,15 @@ def _google_response(messages: List[ChatMessage]) -> str:
     return ""
 
 
-def _invoke_provider(messages: List[ChatMessage], provider: str) -> ChatMessage:
+def _invoke_provider(
+    messages: List[ChatMessage], provider: str, json_mode: bool = False
+) -> ChatMessage:
     if provider == "google":
-        content = _google_response(messages)
+        content = _google_response(messages, json_mode=json_mode)
     elif provider == "azure":
-        content = _azure_response(messages)
+        content = _azure_response(messages, json_mode=json_mode)
     else:
-        content = _openai_response(messages)
+        content = _openai_response(messages, json_mode=json_mode)
     return {"role": "assistant", "content": content.strip()}
 
 
@@ -376,16 +513,66 @@ def _latest_user_query(messages: List[ChatMessage]) -> str:
     return ""
 
 
+class Intent(BaseModel):
+    """The classified intent of the user query."""
+
+    intent: AgentIntent = Field(
+        ..., description="The classified intent of the user query."
+    )
+
+
+class GeneratedSQL(BaseModel):
+    """Structured response for SQL generation."""
+
+    sql: str = Field(
+        ...,
+        description="The full SQL query text respecting safety requirements.",
+    )
+
+
+class VisualizationCodeResponse(BaseModel):
+    """Structured response for visualization code generation."""
+
+    language: Literal["python"] = Field(
+        ..., description="Language name for the emitted code. Must be 'python'."
+    )
+    code: str = Field(..., description="Runnable Python code for the visualization.")
+
+
+class StructuredAnswer(BaseModel):
+    """Structured response for Streamlit UI rendering."""
+
+    answer: str = Field(..., description="Primary user-facing answer in Korean.")
+    highlights: List[str] = Field(
+        default_factory=list,
+        description="Optional bullet points for supplemental details.",
+    )
+
+
+class ClarificationRequest(BaseModel):
+    """Structured follow-up question for multi-agent style prompts."""
+
+    follow_up_question: str = Field(
+        ...,
+        description="A short Korean question requesting missing details.",
+    )
+
 def build_conversation_graph(provider: str | None = None):
     """Compile a LangGraph that routes requests through intent/SQL/visual nodes."""
     selected = (provider or os.environ.get("LLM_PROVIDER") or DEFAULT_PROVIDER).lower()
     workflow = StateGraph(AgentState)
 
     def with_path(state: AgentState, node_name: str, updates: AgentState) -> AgentState:
+        payload = dict(updates)
         path = list(state.get("node_path", []))
         path.append(node_name)
-        updates["node_path"] = path
-        return updates
+        payload["node_path"] = path
+        traces, input_snapshot, output_snapshot, merged_state = _append_node_trace(
+            state, node_name, payload
+        )
+        payload["node_traces"] = traces
+        _log_node_io(node_name, input_snapshot, output_snapshot, merged_state)
+        return payload
 
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
@@ -426,23 +613,19 @@ def build_conversation_graph(provider: str | None = None):
         query = state.get("clean_user_query") or state.get("user_query", "")
         if not query:
             return with_path(state, "intent", {"intent": "simple_answer"})
+
         system_prompt = (
-            "You categorize user requests for a Databricks analytics assistant. "
-            "Valid intents: VISUALIZE (asks for charts/plots), SQL_QUERY (asks for tabular data), "
-            "CLARIFY (question is ambiguous or missing info), SIMPLE_ANSWER (general question "
-            "answerable without running SQL). Reply with one label only."
+            "You categorize user requests for a Databricks analytics assistant."
         )
-        user_prompt = f"User query:\n{query}\n\nIntent label:"
-        intent_text = _call_llm(selected, system_prompt, user_prompt).strip().lower()
-        if "visual" in intent_text:
-            intent: AgentIntent = "visualize"
-        elif "sql" in intent_text or "data" in intent_text:
-            intent = "sql_query"
-        elif "clarify" in intent_text or "clarification" in intent_text:
-            intent = "clarify"
-        else:
-            intent = "simple_answer"
-        return with_path(state, "intent", {"intent": intent})
+        user_prompt = f"User query:\n{query}"
+        try:
+            parsed = _call_structured_llm(selected, system_prompt, user_prompt, Intent)
+            return with_path(state, "intent", {"intent": parsed.intent})
+        except Exception:  # Includes JSON decoding and Pydantic validation errors
+            # Fallback to a simpler classification if JSON mode fails
+            return with_path(
+                state, "intent", {"intent": "simple_answer", "error_message": "의도 분류 실패"}
+            )
 
     def prepare_sql_tool_context(state: AgentState) -> AgentState:
         metadata_text = _format_metadata(state.get("table_metadata"))
@@ -469,7 +652,7 @@ def build_conversation_graph(provider: str | None = None):
             system_prompt = tool_details
         user_prompt = (
             f"Schema information:\n{metadata}\n\nUser request:\n{query}\n\n"
-            "Return only the SQL query."
+            "Populate the `sql` field with the final SQL query."
         )
         if limit:
             user_prompt += f"\nUse an explicit LIMIT no higher than {limit}."
@@ -481,7 +664,13 @@ def build_conversation_graph(provider: str | None = None):
             )
         if retry_count:
             user_prompt += f"\n(Attempt #{retry_count + 1} — pay extra attention to syntax.)"
-        raw_sql = _call_llm(selected, system_prompt, user_prompt).strip()
+        try:
+            structured = _call_structured_llm(
+                selected, system_prompt, user_prompt, GeneratedSQL
+            )
+            raw_sql = structured.sql.strip()
+        except Exception:
+            raw_sql = _call_llm(selected, system_prompt, user_prompt).strip()
         sql = _strip_code_block(raw_sql)
         return with_path(state, "sql_generator", {"sql_query": sql})
 
@@ -506,6 +695,8 @@ def build_conversation_graph(provider: str | None = None):
             return with_path(
                 state, "table_sql", {"error_message": "순차적으로 조회할 테이블이 없습니다."}
             )
+        # NOTE: Using SELECT * for table previews is acceptable here,
+        # as the LLM's SQL generation (for visualization) explicitly avoids it.
         metadata = (state.get("table_metadata") or {}).get(table_name, {})
         limit = metadata.get("preview_limit") or MULTI_TABLE_SAMPLE_LIMIT
         if not isinstance(limit, int) or limit <= 0:
@@ -560,9 +751,17 @@ def build_conversation_graph(provider: str | None = None):
         table_context = f"Current table: {table_name}\n" if table_name else ""
         user_prompt = (
             f"{table_context}User request:\n{user_query}\n\nRows JSON:\n{data_json}\n\n"
-            "Generate concise visualization code."
+            "Generate concise visualization code. Populate `language` and `code` fields."
         )
-        code = _call_llm(selected, system_prompt, user_prompt).strip()
+        try:
+            structured = _call_structured_llm(
+                selected, system_prompt, user_prompt, VisualizationCodeResponse
+            )
+            if structured.language.lower() != "python":
+                raise ValueError("Visualization code must be in Python.")
+            code = structured.code.strip()
+        except Exception:
+            code = _call_llm(selected, system_prompt, user_prompt).strip()
         if "```" not in code:
             code = f"```python\n{code}\n```"
         return with_path(state, "visualization", {"visualization_code": code})
@@ -577,6 +776,7 @@ def build_conversation_graph(provider: str | None = None):
             final_text = f"결과 조회 제한을 {limit}행으로 설정했어요. 새로운 요청으로 계속 진행할 수 있어요."
             response_path = list(state.get("node_path", [])) + ["response"]
             final_text = f"{final_text}{_node_path_diagram(response_path)}"
+            final_text = _append_trace_text(final_text, state)
             messages = state.get("messages", [])
             return with_path(
                 state,
@@ -596,9 +796,21 @@ def build_conversation_graph(provider: str | None = None):
             user_prompt = (
                 f"User query: {user_query}\nIntent: {intent}\n"
                 f"Table previews JSON:\n{previews_json}\n\n"
-                "Write sectioned summaries (one per table)."
+                "Write sectioned summaries (one per table). Populate `answer` and optionally `highlights`."
             )
-            reply = _call_llm(selected, system_prompt, user_prompt).strip()
+            try:
+                structured = _call_structured_llm(
+                    selected, system_prompt, user_prompt, StructuredAnswer
+                )
+                reply = structured.answer.strip()
+                if structured.highlights:
+                    highlight_lines = "\n".join(
+                        f"- {item.strip()}" for item in structured.highlights if item.strip()
+                    )
+                    if highlight_lines:
+                        reply = f"{reply}\n\n하이라이트:\n{highlight_lines}"
+            except Exception:
+                reply = _call_llm(selected, system_prompt, user_prompt).strip()
             final_text = reply
             if visualization_blocks:
                 blocks = "\n\n".join(visualization_blocks)
@@ -616,15 +828,29 @@ def build_conversation_graph(provider: str | None = None):
                 f"Intent: {intent}\nUser query: {user_query}\n"
                 f"SQL: {sql_query or 'N/A'}\nData preview JSON:\n{data_json}\n\n"
                 "Write the final response in Korean, summarizing insights. "
-                "Mention charts if visualization code is provided."
+                "Mention charts if visualization code is provided. "
+                "Populate `answer` and optionally `highlights`."
             )
-            reply = _call_llm(selected, system_prompt, user_prompt).strip()
+            try:
+                structured = _call_structured_llm(
+                    selected, system_prompt, user_prompt, StructuredAnswer
+                )
+                reply = structured.answer.strip()
+                if structured.highlights:
+                    highlight_lines = "\n".join(
+                        f"- {item.strip()}" for item in structured.highlights if item.strip()
+                    )
+                    if highlight_lines:
+                        reply = f"{reply}\n\n하이라이트:\n{highlight_lines}"
+            except Exception:
+                reply = _call_llm(selected, system_prompt, user_prompt).strip()
             final_text = reply
             visualization_code = state.get("visualization_code")
             if visualization_code:
                 final_text = f"{reply}\n\n{visualization_code}"
         response_path = list(state.get("node_path", [])) + ["response"]
         final_text = f"{final_text}{_node_path_diagram(response_path)}"
+        final_text = _append_trace_text(final_text, state)
         messages = state.get("messages", [])
         return with_path(
             state,
@@ -641,11 +867,21 @@ def build_conversation_graph(provider: str | None = None):
             "You need more detail from the user before running SQL. "
             "Ask a short follow-up question in Korean."
         )
-        user_prompt = f"User query:\n{user_query}\n\nAsk what detail is missing."
-        reply = _call_llm(selected, system_prompt, user_prompt).strip()
+        user_prompt = (
+            f"User query:\n{user_query}\n\nAsk what detail is missing. "
+            "Populate the `follow_up_question` field."
+        )
+        try:
+            structured = _call_structured_llm(
+                selected, system_prompt, user_prompt, ClarificationRequest
+            )
+            reply = structured.follow_up_question.strip()
+        except Exception:
+            reply = _call_llm(selected, system_prompt, user_prompt).strip()
         messages = state.get("messages", [])
         clarify_path = list(state.get("node_path", [])) + ["clarify"]
         final_text = f"{reply}{_node_path_diagram(clarify_path)}"
+        final_text = _append_trace_text(final_text, state)
         return with_path(
             state,
             "clarify",
@@ -667,6 +903,7 @@ def build_conversation_graph(provider: str | None = None):
         messages = state.get("messages", [])
         error_path = list(state.get("node_path", [])) + ["error"]
         final_text = f"{text}{_node_path_diagram(error_path)}"
+        final_text = _append_trace_text(final_text, state)
         return with_path(
             state,
             "error",
