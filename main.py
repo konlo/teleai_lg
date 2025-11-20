@@ -58,7 +58,9 @@ LANGGRAPH_DOT = """
 digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
-    extract_user -> configure_limits -> prepare_tables -> intent;
+    extract_user -> configure_limits;
+    configure_limits -> response [label="%limit only"];
+    configure_limits -> prepare_tables;
     intent -> table_select [label="multi-table"];
     table_select -> table_sql -> run_query;
     intent -> s2w_tool [label="visualize/sql"];
