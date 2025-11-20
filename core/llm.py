@@ -396,6 +396,7 @@ def build_conversation_graph(provider: str | None = None):
                 "user_query": query,
                 "clean_user_query": cleaned_query,
                 "sql_tool_active": False,
+                "limits_configured": False,
             },
         )
 
@@ -411,7 +412,11 @@ def build_conversation_graph(provider: str | None = None):
         return with_path(
             state,
             "configure_limits",
-            {"sql_limit": limit, "limit_only": limit_only},
+            {
+                "sql_limit": limit,
+                "limit_only": limit_only,
+                "limits_configured": True,
+            },
         )
 
     def prepare_table_sequence(state: AgentState) -> AgentState:
@@ -712,6 +717,8 @@ def build_conversation_graph(provider: str | None = None):
             return "table_select"
         intent = state.get("intent", "simple_answer")
         if intent in {"visualize", "sql_query"}:
+            if not state.get("limits_configured"):
+                return "configure_limits"
             return "s2w_tool"
         if intent == "clarify":
             return "clarify"
@@ -767,7 +774,7 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_node("error", handle_error)
 
     workflow.set_entry_point("extract_user")
-    workflow.add_edge("extract_user", "configure_limits")
+    workflow.add_edge("extract_user", "intent")
     workflow.add_conditional_edges(
         "configure_limits",
         route_limits,
@@ -778,6 +785,7 @@ def build_conversation_graph(provider: str | None = None):
         "intent",
         route_intent,
         {
+            "configure_limits": "configure_limits",
             "sql_generator": "s2w_tool",
             "clarify": "clarify",
             "response": "response",
