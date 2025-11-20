@@ -114,6 +114,7 @@ MULTI_TABLE_KEYWORDS = (
 )
 MULTI_TABLE_SAMPLE_LIMIT = 200
 MAX_MULTI_TABLES = 5
+LIMIT_DIRECTIVE_PATTERN = re.compile(r"^\s*%limit\s+(\d+)", re.IGNORECASE)
 
 
 def _requests_all_tables(query: str) -> bool:
@@ -271,7 +272,7 @@ def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
     for message in reversed(messages):
         if message["role"] != "user":
             continue
-        override_match = re.search(r"%limit\s+(\d+)", message.get("content", ""), re.IGNORECASE)
+        override_match = LIMIT_DIRECTIVE_PATTERN.match(message.get("content", ""))
         if override_match:
             candidate = int(override_match.group(1))
             return min(candidate, MAX_LIMIT_OVERRIDE)
@@ -293,7 +294,7 @@ def _s2w_tool_description(limit: int, metadata: str) -> str:
         "\n".join(clauses)
         + "\n\nTable schemas (for backticked names):\n"
         + metadata
-        + f"\n\nDefault LIMIT: {limit} (override only when `%limit <value>` is provided, up to {MAX_LIMIT_OVERRIDE})."
+        + f"\n\nDefault LIMIT: {limit} (override only when a message starts with `%limit <value>`, up to {MAX_LIMIT_OVERRIDE})."
     )
 
 
@@ -388,8 +389,8 @@ def build_conversation_graph(provider: str | None = None):
 
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
-        cleaned_query = re.sub(r"%limit\s+\d+", "", query or "", flags=re.IGNORECASE).strip()
-        limit_requested = bool(re.search(r"%limit\s+\d+", query or "", re.IGNORECASE))
+        cleaned_query = re.sub(LIMIT_DIRECTIVE_PATTERN, "", query or "").strip()
+        limit_requested = bool(LIMIT_DIRECTIVE_PATTERN.match(query or ""))
         return with_path(
             state,
             "extract_user",
@@ -410,7 +411,7 @@ def build_conversation_graph(provider: str | None = None):
             limit = override
         user_query = state.get("user_query", "")
         cleaned_query = (state.get("clean_user_query") or "").strip()
-        limit_only = bool(re.search(r"%limit\s+\d+", user_query, re.IGNORECASE)) and not cleaned_query
+        limit_only = bool(LIMIT_DIRECTIVE_PATTERN.match(user_query)) and not cleaned_query
         return with_path(
             state,
             "configure_limits",
