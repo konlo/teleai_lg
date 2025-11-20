@@ -405,7 +405,14 @@ def build_conversation_graph(provider: str | None = None):
         override = _latest_limit_override(messages)
         if override is not None:
             limit = override
-        return with_path(state, "configure_limits", {"sql_limit": limit})
+        user_query = state.get("user_query", "")
+        cleaned_query = (state.get("clean_user_query") or "").strip()
+        limit_only = bool(re.search(r"%limit\s+\d+", user_query, re.IGNORECASE)) and not cleaned_query
+        return with_path(
+            state,
+            "configure_limits",
+            {"sql_limit": limit, "limit_only": limit_only},
+        )
 
     def prepare_table_sequence(state: AgentState) -> AgentState:
         query = state.get("user_query", "")
@@ -569,6 +576,20 @@ def build_conversation_graph(provider: str | None = None):
         user_query = state.get("user_query", "")
         table_outputs = state.get("table_outputs") or []
         visualization_blocks = state.get("visualization_blocks") or []
+        if state.get("limit_only"):
+            limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
+            final_text = f"결과 조회 제한을 {limit}행으로 설정했어요. 새로운 요청으로 계속 진행할 수 있어요."
+            response_path = list(state.get("node_path", [])) + ["response"]
+            final_text = f"{final_text}{_node_path_diagram(response_path)}"
+            messages = state.get("messages", [])
+            return with_path(
+                state,
+                "response",
+                {
+                    "response": final_text,
+                    "messages": messages + [{"role": "assistant", "content": final_text}],
+                },
+            )
         if table_outputs:
             previews_json = _safe_json_dumps(table_outputs)
             system_prompt = (
@@ -724,6 +745,11 @@ def build_conversation_graph(provider: str | None = None):
             return "table_select"
         return "response"
 
+    def route_limits(state: AgentState) -> str:
+        if state.get("limit_only"):
+            return "response"
+        return "prepare_tables"
+
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("configure_limits", configure_limits)
     workflow.add_node("prepare_tables", prepare_table_sequence)
@@ -742,7 +768,11 @@ def build_conversation_graph(provider: str | None = None):
 
     workflow.set_entry_point("extract_user")
     workflow.add_edge("extract_user", "configure_limits")
-    workflow.add_edge("configure_limits", "prepare_tables")
+    workflow.add_conditional_edges(
+        "configure_limits",
+        route_limits,
+        {"response": "response", "prepare_tables": "prepare_tables"},
+    )
     workflow.add_edge("prepare_tables", "intent")
     workflow.add_conditional_edges(
         "intent",
