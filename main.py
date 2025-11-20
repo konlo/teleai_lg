@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         return None
 
 from core.databricks import fetch_table_metadata, fetch_table_preview, list_tables
-from core.llm import ChatMessage, build_conversation_graph
+from core.llm import ChatMessage, DEFAULT_SQL_LIMIT, build_conversation_graph
 
 load_dotenv()
 
@@ -39,6 +39,7 @@ CODE_BLOCK_PATTERN = re.compile(r"```(?:python)?\s*([\s\S]+?)```", re.IGNORECASE
 JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
 LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
+    "configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
     "prepare_tables": "질문/스키마에서 순차 처리 테이블 선정",
     "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
     "s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
@@ -57,7 +58,7 @@ LANGGRAPH_DOT = """
 digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
-    extract_user -> prepare_tables -> intent;
+    extract_user -> configure_limits -> prepare_tables -> intent;
     intent -> table_select [label="multi-table"];
     table_select -> table_sql -> run_query;
     intent -> s2w_tool [label="visualize/sql"];
@@ -272,6 +273,8 @@ def main() -> None:
         st.session_state.table_metadata = {}
     if "node_paths" not in st.session_state:
         st.session_state.node_paths = {}
+    if "sql_limit" not in st.session_state:
+        st.session_state.sql_limit = DEFAULT_SQL_LIMIT
 
     with st.sidebar:
         provider = os.environ.get("LLM_PROVIDER", "google").lower()
@@ -393,11 +396,15 @@ def main() -> None:
                     {
                         "messages": _lc_messages(st.session_state.history),
                         "table_metadata": metadata,
+                        "sql_limit": st.session_state.get("sql_limit", DEFAULT_SQL_LIMIT),
                     }
                 )
                 latest = response_state["messages"][-1]
                 response_text = latest["content"]
                 node_path = response_state.get("node_path", [])
+                st.session_state.sql_limit = response_state.get(
+                    "sql_limit", DEFAULT_SQL_LIMIT
+                )
             except Exception as exc:  # pragma: no cover - Streamlit surface
                 response_text = f"⚠️ Error: {exc}"
             assistant_segments.append(response_text)
