@@ -389,6 +389,7 @@ def build_conversation_graph(provider: str | None = None):
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
         cleaned_query = re.sub(r"%limit\s+\d+", "", query or "", flags=re.IGNORECASE).strip()
+        limit_requested = bool(re.search(r"%limit\s+\d+", query or "", re.IGNORECASE))
         return with_path(
             state,
             "extract_user",
@@ -397,6 +398,7 @@ def build_conversation_graph(provider: str | None = None):
                 "clean_user_query": cleaned_query,
                 "sql_tool_active": False,
                 "limits_configured": False,
+                "limit_requested": limit_requested,
             },
         )
 
@@ -701,6 +703,8 @@ def build_conversation_graph(provider: str | None = None):
         return with_path(state, "table_results", updates)
 
     def route_intent(state: AgentState) -> str:
+        if state.get("limit_requested") and not state.get("limits_configured"):
+            return "configure_limits"
         if state.get("table_queue"):
             return "table_select"
         intent = state.get("intent", "simple_answer")
