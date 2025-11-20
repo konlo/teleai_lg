@@ -114,7 +114,7 @@ MULTI_TABLE_KEYWORDS = (
 )
 MULTI_TABLE_SAMPLE_LIMIT = 200
 MAX_MULTI_TABLES = 5
-LIMIT_DIRECTIVE_PATTERN = re.compile(r"^\s*%limit\s+(\d+)", re.IGNORECASE)
+LIMIT_DIRECTIVE_PATTERN = re.compile(r"%limit\s+(\d+)", re.IGNORECASE)
 
 
 def _requests_all_tables(query: str) -> bool:
@@ -272,7 +272,7 @@ def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
     for message in reversed(messages):
         if message["role"] != "user":
             continue
-        override_match = LIMIT_DIRECTIVE_PATTERN.match(message.get("content", ""))
+        override_match = LIMIT_DIRECTIVE_PATTERN.search(message.get("content", ""))
         if override_match:
             candidate = int(override_match.group(1))
             return min(candidate, MAX_LIMIT_OVERRIDE)
@@ -389,8 +389,8 @@ def build_conversation_graph(provider: str | None = None):
 
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
-        cleaned_query = re.sub(LIMIT_DIRECTIVE_PATTERN, "", query or "").strip()
-        limit_requested = bool(LIMIT_DIRECTIVE_PATTERN.match(query or ""))
+        cleaned_query = re.sub(LIMIT_DIRECTIVE_PATTERN, "", query or "", count=1).strip()
+        limit_requested = bool(LIMIT_DIRECTIVE_PATTERN.search(query or ""))
         return with_path(
             state,
             "extract_user",
@@ -411,7 +411,7 @@ def build_conversation_graph(provider: str | None = None):
             limit = override
         user_query = state.get("user_query", "")
         cleaned_query = (state.get("clean_user_query") or "").strip()
-        limit_only = bool(LIMIT_DIRECTIVE_PATTERN.match(user_query)) and not cleaned_query
+        limit_only = bool(LIMIT_DIRECTIVE_PATTERN.search(user_query)) and not cleaned_query
         return with_path(
             state,
             "configure_limits",
@@ -748,7 +748,14 @@ def build_conversation_graph(provider: str | None = None):
     def route_limits(state: AgentState) -> str:
         if state.get("limit_only"):
             return "response"
-        return "intent"
+        if state.get("table_queue"):
+            return "table_select"
+        intent = state.get("intent", "simple_answer")
+        if intent in {"visualize", "sql_query"}:
+            return "s2w_tool"
+        if intent == "clarify":
+            return "clarify"
+        return "response"
 
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("configure_limits", configure_limits)
@@ -770,7 +777,12 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_conditional_edges(
         "configure_limits",
         route_limits,
-        {"response": "response", "intent": "intent"},
+        {
+            "response": "response",
+            "table_select": "table_select",
+            "s2w_tool": "s2w_tool",
+            "clarify": "clarify",
+        },
     )
     workflow.add_conditional_edges(
         "intent",
