@@ -267,12 +267,15 @@ def _validate_sql_statement(
     return None
 
 
-def _determine_sql_limit(query: str) -> int:
-    override_match = re.search(r"%limit\s+(\d+)", query or "", re.IGNORECASE)
-    if override_match:
-        candidate = int(override_match.group(1))
-        return min(candidate, MAX_LIMIT_OVERRIDE)
-    return DEFAULT_SQL_LIMIT
+def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
+    for message in reversed(messages):
+        if message["role"] != "user":
+            continue
+        override_match = re.search(r"%limit\s+(\d+)", message.get("content", ""), re.IGNORECASE)
+        if override_match:
+            candidate = int(override_match.group(1))
+            return min(candidate, MAX_LIMIT_OVERRIDE)
+    return None
 
 
 def _s2w_tool_description(limit: int, metadata: str) -> str:
@@ -386,17 +389,23 @@ def build_conversation_graph(provider: str | None = None):
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
         cleaned_query = re.sub(r"%limit\s+\d+", "", query or "", flags=re.IGNORECASE).strip()
-        limit = _determine_sql_limit(query)
         return with_path(
             state,
             "extract_user",
             {
                 "user_query": query,
                 "clean_user_query": cleaned_query,
-                "sql_limit": limit,
                 "sql_tool_active": False,
             },
         )
+
+    def configure_limits(state: AgentState) -> AgentState:
+        messages = state.get("messages", [])
+        limit = state.get("sql_limit") or DEFAULT_SQL_LIMIT
+        override = _latest_limit_override(messages)
+        if override is not None:
+            limit = override
+        return with_path(state, "configure_limits", {"sql_limit": limit})
 
     def prepare_table_sequence(state: AgentState) -> AgentState:
         query = state.get("user_query", "")
@@ -411,7 +420,7 @@ def build_conversation_graph(provider: str | None = None):
         return with_path(state, "prepare_tables", updates)
 
     def classify_intent(state: AgentState) -> AgentState:
-        query = state.get("user_query", "")
+        query = state.get("clean_user_query") or state.get("user_query", "")
         if not query:
             return with_path(state, "intent", {"intent": "simple_answer"})
         system_prompt = (
@@ -716,6 +725,7 @@ def build_conversation_graph(provider: str | None = None):
         return "response"
 
     workflow.add_node("extract_user", extract_user_query)
+    workflow.add_node("configure_limits", configure_limits)
     workflow.add_node("prepare_tables", prepare_table_sequence)
     workflow.add_node("intent", classify_intent)
     workflow.add_node("s2w_tool", prepare_sql_tool_context)
@@ -731,7 +741,8 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_node("error", handle_error)
 
     workflow.set_entry_point("extract_user")
-    workflow.add_edge("extract_user", "prepare_tables")
+    workflow.add_edge("extract_user", "configure_limits")
+    workflow.add_edge("configure_limits", "prepare_tables")
     workflow.add_edge("prepare_tables", "intent")
     workflow.add_conditional_edges(
         "intent",
