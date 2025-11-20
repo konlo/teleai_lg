@@ -40,7 +40,6 @@ JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
 LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
     "configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
-    "prepare_tables": "질문/스키마에서 순차 처리 테이블 선정",
     "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
     "s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
     "table_select": "다음 테이블 선택 및 상태 업데이트",
@@ -61,8 +60,7 @@ digraph {
     extract_user -> intent;
     intent -> configure_limits [label="visualize/sql"];
     configure_limits -> response [label="%limit only"];
-    configure_limits -> prepare_tables;
-    prepare_tables -> intent;
+    configure_limits -> intent;
     intent -> table_select [label="multi-table"];
     table_select -> table_sql -> run_query;
     intent -> s2w_tool [label="visualize/sql ready"];

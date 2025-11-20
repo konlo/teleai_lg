@@ -389,6 +389,7 @@ def build_conversation_graph(provider: str | None = None):
     def extract_user_query(state: AgentState) -> AgentState:
         query = _latest_user_query(state.get("messages", []))
         cleaned_query = re.sub(r"%limit\s+\d+", "", query or "", flags=re.IGNORECASE).strip()
+        limit_requested = bool(re.search(r"%limit\s+\d+", query or "", re.IGNORECASE))
         return with_path(
             state,
             "extract_user",
@@ -397,6 +398,7 @@ def build_conversation_graph(provider: str | None = None):
                 "clean_user_query": cleaned_query,
                 "sql_tool_active": False,
                 "limits_configured": False,
+                "limit_requested": limit_requested,
             },
         )
 
@@ -418,18 +420,6 @@ def build_conversation_graph(provider: str | None = None):
                 "limits_configured": True,
             },
         )
-
-    def prepare_table_sequence(state: AgentState) -> AgentState:
-        query = state.get("user_query", "")
-        metadata = state.get("table_metadata") or {}
-        requested = state.get("table_sequence")
-        sequence = _resolve_table_sequence(requested, query, metadata)
-        updates: AgentState = {
-            "table_queue": sequence,
-            "table_outputs": [],
-            "visualization_blocks": [],
-        }
-        return with_path(state, "prepare_tables", updates)
 
     def classify_intent(state: AgentState) -> AgentState:
         query = state.get("clean_user_query") or state.get("user_query", "")
@@ -713,6 +703,8 @@ def build_conversation_graph(provider: str | None = None):
         return with_path(state, "table_results", updates)
 
     def route_intent(state: AgentState) -> str:
+        if state.get("limit_requested") and not state.get("limits_configured"):
+            return "configure_limits"
         if state.get("table_queue"):
             return "table_select"
         intent = state.get("intent", "simple_answer")
@@ -755,11 +747,10 @@ def build_conversation_graph(provider: str | None = None):
     def route_limits(state: AgentState) -> str:
         if state.get("limit_only"):
             return "response"
-        return "prepare_tables"
+        return "intent"
 
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("configure_limits", configure_limits)
-    workflow.add_node("prepare_tables", prepare_table_sequence)
     workflow.add_node("intent", classify_intent)
     workflow.add_node("s2w_tool", prepare_sql_tool_context)
     workflow.add_node("table_select", select_next_table)
@@ -778,9 +769,8 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_conditional_edges(
         "configure_limits",
         route_limits,
-        {"response": "response", "prepare_tables": "prepare_tables"},
+        {"response": "response", "intent": "intent"},
     )
-    workflow.add_edge("prepare_tables", "intent")
     workflow.add_conditional_edges(
         "intent",
         route_intent,
