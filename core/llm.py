@@ -419,18 +419,6 @@ def build_conversation_graph(provider: str | None = None):
             },
         )
 
-    def prepare_table_sequence(state: AgentState) -> AgentState:
-        query = state.get("user_query", "")
-        metadata = state.get("table_metadata") or {}
-        requested = state.get("table_sequence")
-        sequence = _resolve_table_sequence(requested, query, metadata)
-        updates: AgentState = {
-            "table_queue": sequence,
-            "table_outputs": [],
-            "visualization_blocks": [],
-        }
-        return with_path(state, "prepare_tables", updates)
-
     def classify_intent(state: AgentState) -> AgentState:
         query = state.get("clean_user_query") or state.get("user_query", "")
         if not query:
@@ -755,11 +743,10 @@ def build_conversation_graph(provider: str | None = None):
     def route_limits(state: AgentState) -> str:
         if state.get("limit_only"):
             return "response"
-        return "prepare_tables"
+        return "intent"
 
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("configure_limits", configure_limits)
-    workflow.add_node("prepare_tables", prepare_table_sequence)
     workflow.add_node("intent", classify_intent)
     workflow.add_node("s2w_tool", prepare_sql_tool_context)
     workflow.add_node("table_select", select_next_table)
@@ -778,9 +765,8 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_conditional_edges(
         "configure_limits",
         route_limits,
-        {"response": "response", "prepare_tables": "prepare_tables"},
+        {"response": "response", "intent": "intent"},
     )
-    workflow.add_edge("prepare_tables", "intent")
     workflow.add_conditional_edges(
         "intent",
         route_intent,
