@@ -399,7 +399,7 @@ def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
     return None
 
 
-def _s2w_tool_description(limit: int, metadata: str) -> str:
+def _s2w_tool_description(limit: int) -> str:
     clauses = [
         "Tool name: s2w (Safe-to-Visualize SQL Writer).",
         "Purpose: build Databricks SQL optimized for visualization while staying read-only.",
@@ -412,8 +412,6 @@ def _s2w_tool_description(limit: int, metadata: str) -> str:
     ]
     return (
         "\n".join(clauses)
-        + "\n\nTable schemas (for backticked names):\n"
-        + metadata
         + f"\n\nDefault LIMIT: {limit} (override only when a message starts with `%limit <value>`, up to {MAX_LIMIT_OVERRIDE})."
     )
 
@@ -628,9 +626,8 @@ def build_conversation_graph(provider: str | None = None):
             )
 
     def prepare_sql_tool_context(state: AgentState) -> AgentState:
-        metadata_text = _format_metadata(state.get("table_metadata"))
         limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
-        tool_description = _s2w_tool_description(limit, metadata_text)
+        tool_description = _s2w_tool_description(limit)
         return with_path(
             state,
             "s2w_tool",
@@ -642,16 +639,15 @@ def build_conversation_graph(provider: str | None = None):
 
     def generate_sql(state: AgentState) -> AgentState:
         query = state.get("clean_user_query") or state.get("user_query", "")
-        metadata = _format_metadata(state.get("table_metadata"))
         feedback = state.get("sql_validation_error")
         retry_count = state.get("sql_retry_count", 0)
         limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
-        system_prompt = _s2w_tool_description(limit, metadata)
+        system_prompt = _s2w_tool_description(limit)
         tool_details = state.get("sql_tool_description")
         if tool_details:
             system_prompt = tool_details
         user_prompt = (
-            f"Schema information:\n{metadata}\n\nUser request:\n{query}\n\n"
+            f"Schema information:\n{_format_metadata(state.get('table_metadata'))}\n\nUser request:\n{query}\n\n"
             "Populate the `sql` field with the final SQL query."
         )
         if limit:
