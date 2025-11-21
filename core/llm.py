@@ -143,7 +143,11 @@ def _safe_json_dumps(value: Any) -> str:
 def _debug_snapshot(data: Dict[str, Any]) -> Dict[str, Any]:
     """Return a JSON-safe copy of the state or update payload for tracing."""
 
-    sanitized = {key: value for key, value in data.items() if key != "node_traces"}
+    sanitized = {
+        key: value
+        for key, value in data.items()
+        if key not in {"node_traces", "table_metadata"}
+    }
     try:
         return json.loads(_safe_json_dumps(sanitized))
     except Exception:
