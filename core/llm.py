@@ -647,7 +647,7 @@ def build_conversation_graph(provider: str | None = None):
         if tool_details:
             system_prompt = tool_details
         user_prompt = (
-            f"Schema information:\n{_format_metadata(state.get('table_metadata'))}\n\nUser request:\n{query}\n\n"
+            f"User request:\n{query}\n\n"
             "Populate the `sql` field with the final SQL query."
         )
         if limit:
