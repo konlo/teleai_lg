@@ -43,7 +43,6 @@ AgentIntent = Literal["visualize", "sql_query", "simple_answer", "clarify"]
 
 class AgentState(TypedDict, total=False):
     messages: List[ChatMessage]
-    table_metadata: Dict[str, Any]
     table_sequence: List[str]
     table_queue: List[str]
     current_table: str
