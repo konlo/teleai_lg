@@ -436,7 +436,7 @@ def _openai_response(messages: List[ChatMessage], json_mode: bool = False) -> st
 
 
 def _azure_response(messages: List[ChatMessage], json_mode: bool = False) -> str:
-    from openai import AzureOpenAI
+    from openai import AzureOpenAI, BadRequestError
 
     api_key = _ensure_key("AZURE_OPENAI_API_KEY", "Azure OpenAI")
     endpoint = _ensure_key("AZURE_OPENAI_ENDPOINT", "Azure OpenAI")
@@ -451,13 +451,36 @@ def _azure_response(messages: List[ChatMessage], json_mode: bool = False) -> str
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    completion = client.chat.completions.create(
-        **kwargs,
-        model=deployment,
-        messages=[{"role": msg["role"], "content": msg["content"]} for msg in messages],
-        temperature=0.3,
-    )
-    return completion.choices[0].message.content or ""
+    try:
+        completion = client.chat.completions.create(
+            **kwargs,
+            model=deployment,
+            messages=[{"role": msg["role"], "content": msg["content"]} for msg in messages],
+            temperature=0.3,
+        )
+        return completion.choices[0].message.content or ""
+    except BadRequestError as exc:
+        error = getattr(exc, "response", None)
+        details = "Azure OpenAI content filter blocked the request. Please rephrase the prompt to avoid restricted content."
+        try:
+            payload = (error.json() if callable(getattr(error, "json", None)) else {}) or {}
+            info = payload.get("error", {})
+            inner = info.get("innererror", {})
+            if inner.get("code") == "ResponsibleAIPolicyViolation":
+                filters = inner.get("content_filter_result") or {}
+                blocked = [name for name, outcome in filters.items() if outcome.get("filtered")]
+                if blocked:
+                    categories = ", ".join(sorted(blocked))
+                    details = (
+                        "Azure OpenAI blocked the request due to safety filters "
+                        f"({categories}). Try simplifying the wording or using a different provider."
+                    )
+            message = info.get("message")
+            if message:
+                details = message
+        except Exception:
+            pass
+        return details
 
 
 def _google_response(messages: List[ChatMessage], json_mode: bool = False) -> str:
