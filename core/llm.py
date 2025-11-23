@@ -43,11 +43,15 @@ AgentIntent = Literal["visualize", "sql_query", "simple_answer", "clarify"]
 
 class AgentState(TypedDict, total=False):
     messages: List[ChatMessage]
+    limit_requested: bool
+    limits_configured: bool
+    limit_only: bool
     table_sequence: List[str]
     table_queue: List[str]
     current_table: str
     table_outputs: List[Dict[str, Any]]
     visualization_blocks: List[str]
+    table_metadata: Dict[str, Any]
     user_query: str
     clean_user_query: str
     intent: AgentIntent
@@ -107,7 +111,9 @@ def _call_structured_llm(
         {"role": "user", "content": user_prompt.strip()},
     ]
     response = _invoke_provider(messages, provider, json_mode=True)
-    return validator(response["content"])
+    raw_content = response["content"]
+    cleaned = _strip_code_block(raw_content)
+    return validator(cleaned)
 
 
 def _format_metadata(table_metadata: Dict[str, Any] | None) -> str:
@@ -635,6 +641,10 @@ def build_conversation_graph(provider: str | None = None):
 
     def classify_intent(state: AgentState) -> AgentState:
         query = state.get("clean_user_query") or state.get("user_query", "")
+        # Short-circuit when the user only supplied a %limit directive; no need to call the LLM.
+        limit_only = state.get("limit_requested") and not (state.get("clean_user_query") or "").strip()
+        if limit_only:
+            return with_path(state, "intent", {"intent": "simple_answer"})
         if not query:
             return with_path(state, "intent", {"intent": "simple_answer"})
 
@@ -645,10 +655,17 @@ def build_conversation_graph(provider: str | None = None):
         try:
             parsed = _call_structured_llm(selected, system_prompt, user_prompt, Intent)
             return with_path(state, "intent", {"intent": parsed.intent})
-        except Exception:  # Includes JSON decoding and Pydantic validation errors
+        except Exception as exc:  # Includes JSON decoding and Pydantic validation errors
+            error_details = f"{exc.__class__.__name__}: {exc}"
+            print(f"[intent] Intent classification failed: {error_details}")
             # Fallback to a simpler classification if JSON mode fails
             return with_path(
-                state, "intent", {"intent": "simple_answer", "error_message": "의도 분류 실패"}
+                state,
+                "intent",
+                {
+                    "intent": "simple_answer",
+                    "error_message": f"의도 분류 실패: {error_details}",
+                },
             )
 
     def prepare_sql_tool_context(state: AgentState) -> AgentState:
