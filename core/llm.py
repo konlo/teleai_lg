@@ -116,24 +116,6 @@ def _call_structured_llm(
     return validator(cleaned)
 
 
-def _format_metadata(table_metadata: Dict[str, Any] | None) -> str:
-    if not table_metadata:
-        return "No schema information available."
-    lines: List[str] = []
-    for table_name, data in table_metadata.items():
-        if not isinstance(data, dict):
-            lines.append(f"{table_name}: (metadata unavailable)")
-            continue
-        columns = data.get("columns") or []
-        column_text = ", ".join(
-            f"{column.get('name')} {column.get('type')}" for column in columns if column.get("name")
-        )
-        full_name = data.get("full_name")
-        qualified = full_name or table_name
-        lines.append(f"{qualified}: {column_text}")
-    return "\n".join(lines)
-
-
 def _safe_json_dumps(value: Any) -> str:
     def _default(obj: Any) -> Any:
         if isinstance(obj, (datetime, date)):
