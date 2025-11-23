@@ -1,9 +1,17 @@
-langgraph==1.0.3
+langgraph==0.2.38
 streamlit==1.51.0
-openai==2.7.2
-google-generativeai==0.8.5
+openai==1.99.9
+# direct Google Gemini client (langchain-google-genai removed due to core version conflicts)
+google-generativeai==0.5.4
 python-dotenv==1.2.1
 databricks-sql-connector==4.1.4
 matplotlib==3.10.7
 seaborn==0.13.2
 pandas==2.2.3
+
+langchain==0.3.27
+langchain-community==0.3.31
+langchain-core==0.3.79
+langchain-experimental==0.3.4
+langchain-openai==0.3.32
+langchain-text-splitters==0.3.11

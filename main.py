@@ -15,13 +15,21 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     def load_dotenv():
         return None
 
+try:
+    # Newer langchain
+    from langchain.callbacks import StreamlitCallbackHandler
+    _streamlit_cb_error = None
+except Exception as exc1:  # pragma: no cover - optional dependency
+    try:
+        # Older path
+        from langchain.callbacks.streamlit import StreamlitCallbackHandler
+        _streamlit_cb_error = None
+    except Exception as exc2:  # pragma: no cover - optional dependency
+        StreamlitCallbackHandler = None
+        _streamlit_cb_error = f"{exc1} / {exc2}"
+
 from core.databricks import fetch_table_metadata, fetch_table_preview, list_tables
-from core.llm import (
-    ChatMessage,
-    DEFAULT_SQL_LIMIT,
-    MAX_LIMIT_OVERRIDE,
-    build_conversation_graph,
-)
+from core.llm import ChatMessage, DEFAULT_SQL_LIMIT, build_conversation_graph
 
 load_dotenv()
 
@@ -47,7 +55,7 @@ JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
 LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
     "configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
-    "intent": "질문 의도 분류 (visualize/sql/simple/clarify)",
+    "intent_classifier": "질문 의도 분류 (visualize/sql/simple/clarify)",
     "s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
     "table_select": "다음 테이블 선택 및 상태 업데이트",
     "table_sql": "선택된 테이블용 안전한 SQL 생성",
@@ -56,7 +64,7 @@ LANGGRAPH_NODES = {
     "run_query": "Databricks에서 SQL 실행",
     "visualization": "쿼리 결과를 이용한 시각화 코드 작성",
     "table_results": "각 테이블 결과/시각화 누적",
-    "response": "최종 답변/요약 작성",
+    "respond_node": "최종 답변/요약 작성",
     "clarify": "정보가 부족할 때 추가 질문",
     "error": "쿼리 실패 등 오류 안내",
 }
@@ -64,29 +72,29 @@ LANGGRAPH_DOT = """
 digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
-    extract_user -> intent;
-    intent -> configure_limits [label="%limit"];
-    configure_limits -> response [label="%limit only"];
-    intent -> table_select [label="multi-table"];
+    extract_user -> intent_classifier;
+    intent_classifier -> configure_limits [label="%limit"];
+    configure_limits -> respond_node [label="%limit only"];
+    intent_classifier -> table_select [label="multi-table"];
     table_select -> table_sql -> run_query;
-    intent -> s2w_tool [label="visualize/sql ready"];
+    intent_classifier -> s2w_tool [label="visualize/sql ready"];
     s2w_tool -> sql_generator;
-    intent -> clarify [label="clarify"];
-    intent -> response [label="simple"];
+    intent_classifier -> clarify [label="clarify"];
+    intent_classifier -> respond_node [label="simple"];
     sql_generator -> sql_validator;
     sql_validator -> sql_generator [label="retry"];
     sql_validator -> run_query [label="pass"];
     sql_validator -> error [label="max fail"];
     run_query -> visualization [label="visualize"];
     run_query -> table_results [label="multi-table"];
-    run_query -> response [label="sql only"];
+    run_query -> respond_node [label="sql only"];
     run_query -> error [label="error"];
     visualization -> table_results [label="multi-table"];
-    visualization -> response;
+    visualization -> respond_node;
     table_results -> table_select [label="next"];
-    table_results -> response [label="done"];
+    table_results -> respond_node [label="done"];
     clarify -> end;
-    response -> end;
+    respond_node -> end;
     error -> end;
 }
 """
@@ -126,6 +134,19 @@ def _looks_like_json(text: str) -> bool:
     )
 
 
+def _unescape_code_block(code: str) -> str:
+    """Best-effort cleanup for code blocks that arrive as escaped strings."""
+
+    fixed = code
+    if "\\n" in fixed:
+        fixed = fixed.replace("\\n", "\n")
+    if '\\"' in fixed:
+        fixed = fixed.replace('\\"', '"')
+    if "\\'" in fixed:
+        fixed = fixed.replace("\\'", "'")
+    return fixed
+
+
 def _normalize_json_literals(code: str) -> str:
     """Convert JSON-style literals (null/true/false) to Python values."""
 
@@ -148,7 +169,8 @@ def _execute_visualization_code(code: str) -> List[bytes]:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    normalized_code = _normalize_json_literals(code)
+    cleaned_code = _unescape_code_block(code)
+    normalized_code = _normalize_json_literals(cleaned_code)
     exec_globals: Dict[str, Any] = {"__name__": "__main__"}
     before = set(plt.get_fignums())
     try:
@@ -390,6 +412,16 @@ def main() -> None:
                 st.markdown(f"- **{node_key}**: {description}")
             st.graphviz_chart(LANGGRAPH_DOT)
 
+        trace_container = st.expander("LLM Trace (Streamlit callback)", expanded=False)
+        if StreamlitCallbackHandler is None:
+            trace_container.info(
+                "StreamlitCallbackHandler를 불러오지 못했습니다. "
+                "langchain 버전을 확인하거나 `pip install langchain` 후 다시 실행해 주세요."
+                f"{f' (import error: {_streamlit_cb_error})' if _streamlit_cb_error else ''}"
+            )
+        else:
+            trace_container.caption("여기에서 LLM 호출 로그를 확인할 수 있어요.")
+
     for index, (role, content) in enumerate(st.session_state.history):
         with st.chat_message(role):
             st.markdown(content)
@@ -404,7 +436,6 @@ def main() -> None:
         limit_override_match = LIMIT_DIRECTIVE_PATTERN.search(prompt)
         if limit_override_match:
             limit_value = int(limit_override_match.group(1))
-            limit_value = min(limit_value, MAX_LIMIT_OVERRIDE)
             st.session_state.sql_limit = limit_value
 
         table_names: List[str] = []
@@ -446,12 +477,16 @@ def main() -> None:
             try:
                 graph = st.session_state.graph
                 metadata = st.session_state.get("table_metadata", {})
+                callbacks = []
+                if StreamlitCallbackHandler is not None:
+                    callbacks.append(StreamlitCallbackHandler(trace_container))
                 response_state = graph.invoke(
                     {
                         "messages": _lc_messages(st.session_state.history),
                         "table_metadata": metadata,
                         "sql_limit": st.session_state.get("sql_limit", DEFAULT_SQL_LIMIT),
-                    }
+                    },
+                    config={"callbacks": callbacks} if callbacks else None,
                 )
                 latest = response_state["messages"][-1]
                 response_text = latest["content"]

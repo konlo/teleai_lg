@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 
 from langgraph.graph import END, StateGraph
 
-from core.databricks import run_sql_query
+from core.databricks import _default_catalog_schema, _quote_identifier, run_sql_query
 
 load_dotenv()
 
@@ -133,7 +133,7 @@ def _debug_snapshot(data: Dict[str, Any]) -> Dict[str, Any]:
     sanitized = {
         key: value
         for key, value in data.items()
-        if key not in {"node_traces", "table_metadata"}
+        if key not in {"node_traces", "table_metadata", "query_result"}
     }
     try:
         return json.loads(_safe_json_dumps(sanitized))
@@ -179,11 +179,11 @@ def _log_node_io(
         state_json = _safe_json_dumps(merged_state)
     except Exception:
         state_json = str(merged_state)
-    print(
-        f"\n[{node_name}] 입력:\n{input_json}\n"
-        f"[{node_name}] 출력:\n{output_json}\n"
-        f"[{node_name}] 상태:\n{state_json}\n"
-    )
+    # print(
+    #     f"\n[{node_name}] 입력:\n{input_json}\n"
+    #     f"[{node_name}] 출력:\n{output_json}\n"
+    #     f"[{node_name}] 상태:\n{state_json}\n"
+    # )
 
 
 def _format_node_traces(traces: List[Dict[str, Any]] | None) -> str:
@@ -271,7 +271,14 @@ def _table_full_name(table_name: str, metadata: Dict[str, Any] | None) -> str:
     full_name = (metadata or {}).get("full_name")
     if full_name:
         return full_name
-    return table_name
+    try:
+        catalog, schema = _default_catalog_schema()
+        return ".".join(
+            [_quote_identifier(part) for part in (catalog, schema, table_name)]
+        )
+    except Exception:
+        # If env vars are missing, fall back to the raw table name to avoid hard failures.
+        return table_name
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
@@ -279,7 +286,6 @@ SQL_DANGER_PATTERN = re.compile(r"(?i)\b(drop|delete|alter|update|insert|merge|t
 SQL_SELECT_PATTERN = re.compile(r"(?i)\bselect\b")
 SQL_VALIDATION_MAX_RETRIES = 2
 DEFAULT_SQL_LIMIT = 500
-MAX_LIMIT_OVERRIDE = 2000
 
 
 def _strip_code_block(text: str) -> str:
@@ -385,8 +391,7 @@ def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
             continue
         override_match = LIMIT_DIRECTIVE_PATTERN.search(message.get("content", ""))
         if override_match:
-            candidate = int(override_match.group(1))
-            return min(candidate, MAX_LIMIT_OVERRIDE)
+            return int(override_match.group(1))
     return None
 
 
@@ -398,12 +403,12 @@ def _s2w_tool_description(limit: int) -> str:
         "- Always start filters with `WHERE 1=1` even when no additional conditions exist.",
         "- Wrap every table identifier in backticks and keep the fully-qualified names from the schema section.",
         "- Select only the columns required for the requested chart; avoid `SELECT *`.",
-        "- Apply an explicit LIMIT and keep it at or below the requested bound.",
+        f"- Apply an explicit LIMIT {limit} (do not choose a smaller value unless a lower user limit is given).",
         "- Keep the statement single-query and free of DDL/DML.",
     ]
     return (
         "\n".join(clauses)
-        + f"\n\nDefault LIMIT: {limit} (override only when a message starts with `%limit <value>`, up to {MAX_LIMIT_OVERRIDE})."
+        + f"\n\nDefault LIMIT: {limit} (override when a message starts with `%limit <value>`)."
     )
 
 
@@ -626,9 +631,9 @@ def build_conversation_graph(provider: str | None = None):
         # Short-circuit when the user only supplied a %limit directive; no need to call the LLM.
         limit_only = state.get("limit_requested") and not (state.get("clean_user_query") or "").strip()
         if limit_only:
-            return with_path(state, "intent", {"intent": "simple_answer"})
+            return with_path(state, "intent_classifier", {"intent": "simple_answer"})
         if not query:
-            return with_path(state, "intent", {"intent": "simple_answer"})
+            return with_path(state, "intent_classifier", {"intent": "simple_answer"})
 
         system_prompt = (
             "You categorize user requests for a Databricks analytics assistant."
@@ -636,14 +641,14 @@ def build_conversation_graph(provider: str | None = None):
         user_prompt = f"User query:\n{query}"
         try:
             parsed = _call_structured_llm(selected, system_prompt, user_prompt, Intent)
-            return with_path(state, "intent", {"intent": parsed.intent})
+            return with_path(state, "intent_classifier", {"intent": parsed.intent})
         except Exception as exc:  # Includes JSON decoding and Pydantic validation errors
             error_details = f"{exc.__class__.__name__}: {exc}"
             print(f"[intent] Intent classification failed: {error_details}")
             # Fallback to a simpler classification if JSON mode fails
             return with_path(
                 state,
-                "intent",
+                "intent_classifier",
                 {
                     "intent": "simple_answer",
                     "error_message": f"의도 분류 실패: {error_details}",
@@ -676,7 +681,7 @@ def build_conversation_graph(provider: str | None = None):
             "Populate the `sql` field with the final SQL query."
         )
         if limit:
-            user_prompt += f"\nUse an explicit LIMIT no higher than {limit}."
+            user_prompt += f"\nUse an explicit LIMIT {limit} (do not pick a smaller value)."
         if feedback:
             user_prompt += (
                 "\n\nA previous attempt failed automatic validation for this reason:\n"
@@ -792,16 +797,17 @@ def build_conversation_graph(provider: str | None = None):
         user_query = state.get("user_query", "")
         table_outputs = state.get("table_outputs") or []
         visualization_blocks = state.get("visualization_blocks") or []
+        sql_query = state.get("sql_query", "")
         if state.get("limit_only"):
             limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
             final_text = f"결과 조회 제한을 {limit}행으로 설정했어요. 새로운 요청으로 계속 진행할 수 있어요."
-            response_path = list(state.get("node_path", [])) + ["response"]
+            response_path = list(state.get("node_path", [])) + ["respond_node"]
             final_text = f"{final_text}{_node_path_diagram(response_path)}"
             final_text = _append_trace_text(final_text, state)
             messages = state.get("messages", [])
             return with_path(
                 state,
-                "response",
+                "respond_node",
                 {
                     "response": final_text,
                     "messages": messages + [{"role": "assistant", "content": final_text}],
@@ -840,7 +846,6 @@ def build_conversation_graph(provider: str | None = None):
             rows = state.get("query_result", []) or []
             sample = rows[:20]
             data_json = _safe_json_dumps(sample)
-            sql_query = state.get("sql_query", "")
             system_prompt = (
                 "You are a helpful analytics assistant. Summarize query results clearly. "
                 "If no data is available, respond conversationally using general knowledge."
@@ -869,13 +874,15 @@ def build_conversation_graph(provider: str | None = None):
             visualization_code = state.get("visualization_code")
             if visualization_code:
                 final_text = f"{reply}\n\n{visualization_code}"
-        response_path = list(state.get("node_path", [])) + ["response"]
+        if sql_query:
+            final_text = f"{final_text}\n\n생성된 SQL:\n```sql\n{sql_query}\n```"
+        response_path = list(state.get("node_path", [])) + ["respond_node"]
         final_text = f"{final_text}{_node_path_diagram(response_path)}"
         final_text = _append_trace_text(final_text, state)
         messages = state.get("messages", [])
         return with_path(
             state,
-            "response",
+            "respond_node",
             {
                 "response": final_text,
                 "messages": messages + [{"role": "assistant", "content": final_text}],
@@ -991,21 +998,21 @@ def build_conversation_graph(provider: str | None = None):
             return "table_results"
         if state.get("intent") == "visualize" and state.get("query_result"):
             return "visualization"
-        return "response"
+        return "respond_node"
 
     def route_visualization_next(state: AgentState) -> str:
         if state.get("current_table"):
             return "table_results"
-        return "response"
+        return "respond_node"
 
     def route_table_progress(state: AgentState) -> str:
         if state.get("table_queue"):
             return "table_select"
-        return "response"
+        return "respond_node"
 
     def route_limits(state: AgentState) -> str:
         if state.get("limit_only"):
-            return "response"
+            return "respond_node"
         if state.get("table_queue"):
             return "table_select"
         intent = state.get("intent", "simple_answer")
@@ -1013,11 +1020,11 @@ def build_conversation_graph(provider: str | None = None):
             return "s2w_tool"
         if intent == "clarify":
             return "clarify"
-        return "response"
+        return "respond_node"
 
     workflow.add_node("extract_user", extract_user_query)
     workflow.add_node("configure_limits", configure_limits)
-    workflow.add_node("intent", classify_intent)
+    workflow.add_node("intent_classifier", classify_intent)
     workflow.add_node("s2w_tool", prepare_sql_tool_context)
     workflow.add_node("table_select", select_next_table)
     workflow.add_node("table_sql", build_table_sql)
@@ -1026,30 +1033,30 @@ def build_conversation_graph(provider: str | None = None):
     workflow.add_node("run_query", execute_sql)
     workflow.add_node("visualization", plan_visualization)
     workflow.add_node("table_results", collect_table_results)
-    workflow.add_node("response", respond)
+    workflow.add_node("respond_node", respond)
     workflow.add_node("clarify", clarify)
     workflow.add_node("error", handle_error)
 
     workflow.set_entry_point("extract_user")
-    workflow.add_edge("extract_user", "intent")
+    workflow.add_edge("extract_user", "intent_classifier")
     workflow.add_conditional_edges(
         "configure_limits",
         route_limits,
         {
-            "response": "response",
+            "respond_node": "respond_node",
             "table_select": "table_select",
             "s2w_tool": "s2w_tool",
             "clarify": "clarify",
         },
     )
     workflow.add_conditional_edges(
-        "intent",
+        "intent_classifier",
         route_intent,
         {
             "configure_limits": "configure_limits",
             "sql_generator": "s2w_tool",
             "clarify": "clarify",
-            "response": "response",
+            "respond_node": "respond_node",
             "table_select": "table_select",
         },
     )
@@ -1072,7 +1079,7 @@ def build_conversation_graph(provider: str | None = None):
         {
             "table_results": "table_results",
             "visualization": "visualization",
-            "response": "response",
+            "respond_node": "respond_node",
             "error": "error",
         },
     )
@@ -1081,7 +1088,7 @@ def build_conversation_graph(provider: str | None = None):
         route_visualization_next,
         {
             "table_results": "table_results",
-            "response": "response",
+            "respond_node": "respond_node",
         },
     )
     workflow.add_conditional_edges(
@@ -1089,11 +1096,11 @@ def build_conversation_graph(provider: str | None = None):
         route_table_progress,
         {
             "table_select": "table_select",
-            "response": "response",
+            "respond_node": "respond_node",
         },
     )
     workflow.add_edge("clarify", END)
-    workflow.add_edge("response", END)
+    workflow.add_edge("respond_node", END)
     workflow.add_edge("error", END)
     return workflow.compile()
 
