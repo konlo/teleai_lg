@@ -52,6 +52,8 @@ CODE_BLOCK_PATTERN = re.compile(r"```(?P<lang>\w+)?\s*([\s\S]+?)```", re.IGNOREC
 # visualization code snippets. This avoids NameError when the model returns
 # data samples containing null/true/false.
 JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
+# Bump this to force Streamlit to rebuild the LangGraph when graph logic changes.
+GRAPH_BUILD_ID = "2024-09-09-a"
 LANGGRAPH_NODES = {
     "extract_user": "대화 내 최신 사용자 질문 추출",
     "configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
@@ -162,16 +164,23 @@ def _is_graphviz_code(code: str) -> bool:
     return normalized.lower().startswith(candidates) or "rankdir=" in code
 
 
-def _execute_visualization_code(code: str) -> List[bytes]:
+def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = None) -> List[bytes]:
     """Run plotting code and return rendered figure PNG bytes."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import pandas as pd
 
     cleaned_code = _unescape_code_block(code)
     normalized_code = _normalize_json_literals(cleaned_code)
-    exec_globals: Dict[str, Any] = {"__name__": "__main__"}
+    exec_globals: Dict[str, Any] = {
+        "__name__": "__main__",
+        "pd": pd,
+        "plt": plt,
+    }
+    if rows is not None:
+        exec_globals["df"] = pd.DataFrame(rows)
     before = set(plt.get_fignums())
     try:
         exec(normalized_code, exec_globals, exec_globals)
@@ -224,11 +233,17 @@ def _append_visualization_message(message_index: int, level: str, text: str) -> 
     messages.setdefault(message_index, []).append({"level": level, "text": text})
 
 
-def _handle_visualization_blocks(text: str) -> None:
+def _handle_visualization_blocks(text: str, message_index: int) -> None:
     code_blocks = _extract_code_blocks(text)
     if not code_blocks:
         return
-    message_index = len(st.session_state.history) - 1
+    viz_rows_by_msg = st.session_state.get("viz_rows", {})
+    viz_tables_by_msg = st.session_state.get("viz_table_outputs", {})
+    rows_for_msg = viz_rows_by_msg.get(message_index) or []
+    if not rows_for_msg:
+        table_outputs = viz_tables_by_msg.get(message_index) or []
+        if table_outputs:
+            rows_for_msg = table_outputs[0].get("rows") or []
     for idx, (lang, code) in enumerate(code_blocks, start=1):
         lang_lower = lang or ""
         lang_lower = lang_lower.lower()
@@ -260,8 +275,10 @@ def _handle_visualization_blocks(text: str) -> None:
                 f"Code block {idx}은 언어 미지정 블록이라 실행하지 않았어요.",
             )
             continue
+        # For Python visualization blocks, show the code before execution.
+        st.code(code, language="python")
         try:
-            images = _execute_visualization_code(code)
+            images = _execute_visualization_code(code, rows_for_msg)
         except Exception as exc:  # pragma: no cover - Streamlit surface
             _append_visualization_message(
                 message_index, "error", f"⚠️ Code block {idx} 실행 중 오류: {exc}"
@@ -362,9 +379,11 @@ def main() -> None:
         if (
             "graph" not in st.session_state
             or st.session_state.get("graph_provider") != provider
+            or st.session_state.get("graph_build_id") != GRAPH_BUILD_ID
         ):
             st.session_state.graph = build_conversation_graph(provider=provider)
             st.session_state.graph_provider = provider
+            st.session_state.graph_build_id = GRAPH_BUILD_ID
 
         with st.expander("Databricks Tables", expanded=True):
             refresh_requested = st.button("Refresh tables", use_container_width=True)
@@ -500,8 +519,16 @@ def main() -> None:
             combined_text = "\n\n".join(segment for segment in assistant_segments if segment)
             st.session_state.history.append(("assistant", combined_text))
             message_index = len(st.session_state.history) - 1
-            st.markdown(response_text)
-            _handle_visualization_blocks(response_text)
+            # Cache data for visualization execution without embedding it in the code text.
+            viz_rows = st.session_state.setdefault("viz_rows", {})
+            viz_rows[message_index] = response_state.get("query_result") or []
+            viz_tables = st.session_state.setdefault("viz_table_outputs", {})
+            viz_tables[message_index] = response_state.get("table_outputs") or []
+            if node_path and node_path[-1] == "error":
+                st.error(response_text)
+            else:
+                st.markdown(response_text)
+            _handle_visualization_blocks(response_text, message_index)
             _store_node_path(message_index, node_path)
             _render_node_flow(message_index)
 

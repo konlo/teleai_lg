@@ -44,7 +44,6 @@ AgentIntent = Literal["visualize", "sql_query", "simple_answer", "clarify"]
 class AgentState(TypedDict, total=False):
     messages: List[ChatMessage]
     limit_requested: bool
-    limits_configured: bool
     limit_only: bool
     table_sequence: List[str]
     table_queue: List[str]
@@ -198,17 +197,12 @@ def _format_node_traces(traces: List[Dict[str, Any]] | None) -> str:
         segments.append(f"[{node_name}] 출력:")
         output_payload = _safe_json_dumps(trace.get("output", {}))
         segments.append(f"```json\n{output_payload}\n```")
-        state_payload = _safe_json_dumps(trace.get("state", {}))
-        segments.append(f"[{node_name}] 상태:")
-        segments.append(f"```json\n{state_payload}\n```")
     return "\n".join(segments)
 
 
 def _append_trace_text(text: str, state: AgentState) -> str:
-    trace_text = _format_node_traces(state.get("node_traces"))
-    if not trace_text:
-        return text
-    return f"{text}{trace_text}"
+    # Suppress node I/O trace output in the final response to keep user-facing text clean.
+    return text
 
 
 MULTI_TABLE_KEYWORDS = (
@@ -395,7 +389,34 @@ def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
     return None
 
 
-def _s2w_tool_description(limit: int) -> str:
+def _format_schema_context(table_metadata: Dict[str, Any] | None) -> str:
+    """Build a short schema section listing full table identifiers."""
+    if not table_metadata:
+        return ""
+    lines = ["Schema context (use identifiers exactly as provided):"]
+    for table_name, metadata in table_metadata.items():
+        full_name = (metadata or {}).get("full_name")
+        columns = (metadata or {}).get("columns") or []
+        if not full_name:
+            continue
+        column_text = ""
+        if columns:
+            col_parts = []
+            for col in columns:
+                name = col.get("name") or ""
+                col_type = col.get("type") or ""
+                if name:
+                    col_parts.append(f"{name} ({col_type})")
+            if col_parts:
+                column_text = " | columns: " + ", ".join(col_parts)
+        lines.append(f"- {table_name}: {full_name}{column_text}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
+def _s2w_tool_description(limit: int, table_metadata: Dict[str, Any] | None = None) -> str:
+    schema_context = _format_schema_context(table_metadata)
     clauses = [
         "Tool name: s2w (Safe-to-Visualize SQL Writer).",
         "Purpose: build Databricks SQL optimized for visualization while staying read-only.",
@@ -405,9 +426,13 @@ def _s2w_tool_description(limit: int) -> str:
         "- Select only the columns required for the requested chart; avoid `SELECT *`.",
         f"- Apply an explicit LIMIT {limit} (do not choose a smaller value unless a lower user limit is given).",
         "- Keep the statement single-query and free of DDL/DML.",
+        "- Use the fully-qualified table names exactly as listed below; do not invent or change catalogs/schemas.",
     ]
+    description = "\n".join(clauses)
+    if schema_context:
+        description = f"{description}\n\n{schema_context}"
     return (
-        "\n".join(clauses)
+        description
         + f"\n\nDefault LIMIT: {limit} (override when a message starts with `%limit <value>`)."
     )
 
@@ -602,7 +627,6 @@ def build_conversation_graph(provider: str | None = None):
                 "user_query": query,
                 "clean_user_query": cleaned_query,
                 "sql_tool_active": False,
-                "limits_configured": False,
                 "limit_requested": limit_requested,
             },
         )
@@ -622,7 +646,6 @@ def build_conversation_graph(provider: str | None = None):
             {
                 "sql_limit": limit,
                 "limit_only": limit_only,
-                "limits_configured": True,
             },
         )
 
@@ -657,7 +680,7 @@ def build_conversation_graph(provider: str | None = None):
 
     def prepare_sql_tool_context(state: AgentState) -> AgentState:
         limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
-        tool_description = _s2w_tool_description(limit)
+        tool_description = _s2w_tool_description(limit, state.get("table_metadata"))
         return with_path(
             state,
             "s2w_tool",
@@ -672,7 +695,7 @@ def build_conversation_graph(provider: str | None = None):
         feedback = state.get("sql_validation_error")
         retry_count = state.get("sql_retry_count", 0)
         limit = state.get("sql_limit", DEFAULT_SQL_LIMIT)
-        system_prompt = _s2w_tool_description(limit)
+        system_prompt = _s2w_tool_description(limit, state.get("table_metadata"))
         tool_details = state.get("sql_tool_description")
         if tool_details:
             system_prompt = tool_details
@@ -764,20 +787,22 @@ def build_conversation_graph(provider: str | None = None):
 
     def plan_visualization(state: AgentState) -> AgentState:
         rows = state.get("query_result", []) or []
-        sample = rows[:50]
+        sample = rows[:10]
         data_json = _safe_json_dumps(sample)
         user_query = state.get("user_query", "")
         system_prompt = (
             "You create Matplotlib visualization code for tabular data. "
-            "Always import matplotlib.pyplot as plt and use pandas as pd to build a DataFrame "
-            "from the provided rows. Close with plt.tight_layout(). "
-            "Return only a Python code block."
+            "A pandas DataFrame named `df` is already constructed from the provided rows; use it directly. "
+            "Imports for pandas as pd and matplotlib.pyplot as plt are already available. "
+            "Close with plt.tight_layout(). Return only a Python code block."
         )
         table_name = state.get("current_table")
         table_context = f"Current table: {table_name}\n" if table_name else ""
         user_prompt = (
-            f"{table_context}User request:\n{user_query}\n\nRows JSON:\n{data_json}\n\n"
-            "Generate concise visualization code. Populate `language` and `code` fields."
+            f"{table_context}User request:\n{user_query}\n\n"
+            f"Sample rows JSON (for schema only):\n{data_json}\n\n"
+            "Generate concise visualization code that assumes a DataFrame `df` is already available. "
+            "Populate `language` and `code` fields."
         )
         try:
             structured = _call_structured_llm(
@@ -788,9 +813,9 @@ def build_conversation_graph(provider: str | None = None):
             code = structured.code.strip()
         except Exception:
             code = _call_llm(selected, system_prompt, user_prompt).strip()
-        if "```" not in code:
-            code = f"```python\n{code}\n```"
-        return with_path(state, "visualization", {"visualization_code": code})
+        clean_code = _strip_code_block(code)
+        wrapped = f"```python\n{clean_code}\n```"
+        return with_path(state, "visualization", {"visualization_code": wrapped})
 
     def respond(state: AgentState) -> AgentState:
         intent = state.get("intent", "simple_answer")
@@ -969,18 +994,16 @@ def build_conversation_graph(provider: str | None = None):
         return with_path(state, "table_results", updates)
 
     def route_intent(state: AgentState) -> str:
-        if state.get("limit_requested") and not state.get("limits_configured"):
+        if state.get("limit_requested"):
             return "configure_limits"
         if state.get("table_queue"):
             return "table_select"
         intent = state.get("intent", "simple_answer")
         if intent in {"visualize", "sql_query"}:
-            if not state.get("limits_configured"):
-                return "configure_limits"
             return "s2w_tool"
         if intent == "clarify":
             return "clarify"
-        return "response"
+        return "respond_node"
 
     def route_validation(state: AgentState) -> str:
         if state.get("sql_validation_error"):
@@ -1054,7 +1077,7 @@ def build_conversation_graph(provider: str | None = None):
         route_intent,
         {
             "configure_limits": "configure_limits",
-            "sql_generator": "s2w_tool",
+            "s2w_tool": "s2w_tool",
             "clarify": "clarify",
             "respond_node": "respond_node",
             "table_select": "table_select",
