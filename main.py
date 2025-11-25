@@ -29,7 +29,8 @@ except Exception as exc1:  # pragma: no cover - optional dependency
         _streamlit_cb_error = f"{exc1} / {exc2}"
 
 from core.databricks import fetch_table_metadata, fetch_table_preview, list_tables
-from core.llm import ChatMessage, DEFAULT_SQL_LIMIT, build_conversation_graph
+from core.llm import ChatMessage, DEFAULT_SQL_LIMIT
+from core.graph import build_conversation_graph
 
 load_dotenv()
 
@@ -162,6 +163,13 @@ def _normalize_json_literals(code: str) -> str:
     replacements = {"null": "None", "true": "True", "false": "False"}
     return JSON_LITERAL_PATTERN.sub(lambda match: replacements[match.group(1)], code)
 
+def _sanitize_python_block(code: str) -> str:
+    """Remove trailing backslashes/newline artifacts that break syntax."""
+    cleaned_lines: List[str] = []
+    for line in code.splitlines():
+        cleaned_lines.append(line.rstrip("\\"))
+    return "\n".join(cleaned_lines)
+
 
 def _is_graphviz_code(code: str) -> bool:
     """Heuristically detect Graphviz/DOT snippets to avoid exec syntax errors."""
@@ -180,7 +188,8 @@ def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = N
     import pandas as pd
 
     cleaned_code = _unescape_code_block(code)
-    normalized_code = _normalize_json_literals(cleaned_code)
+    sanitized_code = _sanitize_python_block(cleaned_code)
+    normalized_code = _normalize_json_literals(sanitized_code)
     exec_globals: Dict[str, Any] = {
         "__name__": "__main__",
         "pd": pd,
@@ -191,6 +200,9 @@ def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = N
     before = set(plt.get_fignums())
     try:
         exec(normalized_code, exec_globals, exec_globals)
+    except KeyError as exc:  # pragma: no cover - provide column context
+        cols = list(exec_globals.get("df", pd.DataFrame()).columns)
+        raise KeyError(f"{exc} (available columns: {cols})") from exc
     except SyntaxError as exc:  # pragma: no cover - handled in UI path
         details = exc.msg
         if exc.text:
@@ -220,23 +232,10 @@ def _render_visualizations(message_index: int) -> None:
     visualizations = st.session_state.get("visualizations", {})
     code_blocks = st.session_state.get("visualization_codes", {})
     graphviz_blocks = st.session_state.get("visualization_graphs", {})
-    messages = st.session_state.get("visualization_messages", {})
-    # for code in code_blocks.get(message_index, []):
-    #     st.code(code, language="python")
-    # for code in graphviz_blocks.get(message_index, []):
-    #     st.graphviz_chart(code)
+    # Skip visualization_messages (node I/O logs) to reduce noise.
     for idx, image in enumerate(visualizations.get(message_index, []), start=1):
         caption = f"Visualization result #{idx}"
         st.image(image, caption=caption)
-    for entry in messages.get(message_index, []):
-        level = entry.get("level", "info")
-        text = entry.get("text", "")
-        if level == "node_error":
-            st.error(text)
-        elif level == "warning":
-            st.warning(text)
-        else:
-            st.info(text)
 
 
 def _append_visualization_images(message_index: int, images: List[bytes]) -> None:
@@ -255,6 +254,11 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
     code_blocks = _extract_code_blocks(text)
     if not code_blocks:
         return
+    # Reset stored outputs for this message index to avoid duplicate renders across reruns.
+    st.session_state.setdefault("visualizations", {})[message_index] = []
+    st.session_state.setdefault("visualization_codes", {})[message_index] = []
+    st.session_state.setdefault("visualization_graphs", {})[message_index] = []
+    st.session_state.setdefault("visualization_messages", {})[message_index] = []
     viz_rows_by_msg = st.session_state.get("viz_rows", {})
     viz_tables_by_msg = st.session_state.get("viz_table_outputs", {})
     rows_for_msg = viz_rows_by_msg.get(message_index) or []
@@ -269,7 +273,7 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
         lang_lower = lang or ""
         lang_lower = lang_lower.lower()
         if lang_lower in {"dot", "graphviz"} or _is_graphviz_code(code):
-            # st.graphviz_chart(code)
+            st.graphviz_chart(code)
             graphs = st.session_state.setdefault("visualization_graphs", {})
             graphs.setdefault(message_index, []).append(code)
             _append_visualization_message(
@@ -277,22 +281,18 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
             continue
         if lang_lower == "json" or _looks_like_json(code):
             st.code(code, language="json")
-            _append_visualization_message(
-                message_index,
-                "info",
-                f"Code block {idx}은 JSON 정보 블록이라 실행하지 않았어요.",
-            )
             continue
         if lang_lower and lang_lower != "python":
-            _append_visualization_message(
-                message_index,
-                "warning",
-                f"Code block {idx}은 지원되지 않는 언어({lang})라 실행하지 않았어요.",
-            )
+            # _append_visualization_message(
+            #     message_index,
+            #     "warning",
+            #     f"Code block {idx}은 지원되지 않는 언어({lang})라 실행하지 않았어요.",
+            # )
             continue
         if not lang_lower:
-            # Treat language-omitted blocks as Python for node_visualization.
-            lang_lower = "python"
+            # 언어 미지정 블록은 실행하지 않고 코드만 표시
+            st.code(code)
+            continue
         if lang_lower and lang_lower != "python":
             _append_visualization_message(
                 message_index,
