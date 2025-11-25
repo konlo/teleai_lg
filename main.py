@@ -245,17 +245,40 @@ def main() -> None:
                 st.warning(tables_error)
             elif tables:
                 table_metadata = st.session_state.get("state_table_metadata", {})
-                for name in tables:
-                    st.write(f"- {name}")
-                    metadata = table_metadata.get(name, {})
-                    columns = metadata.get("columns")
+                selected_table = st.selectbox(
+                    "테이블 선택",
+                    tables,
+                    key="sidebar_table_select",
+                )
+                if selected_table:
+                    metadata = table_metadata.get(selected_table, {})
+                    full_name = metadata.get("full_name")
+                    if full_name:
+                        st.caption(f"식별자: {full_name}")
+                    columns = metadata.get("columns") or []
                     if columns:
-                        schema_text = ", ".join(
-                            f"{col['name']} ({col['type']})" for col in columns
-                        )
-                        st.caption(schema_text)
+                        column_names = [col.get("name", "") for col in columns if col.get("name")]
+                        column_display = [
+                            f"{col.get('name', '')} ({col.get('type', '')})"
+                            for col in columns
+                            if col.get("name")
+                        ]
+                        if column_names:
+                            display_map = dict(zip(column_names, column_display))
+                            selected_col = st.selectbox(
+                                "컬럼 선택",
+                                column_names,
+                                format_func=lambda name: display_map.get(name, name),
+                                key=f"sidebar_column_select_{selected_table}",
+                            )
+                            if selected_col:
+                                st.caption(f"선택된 컬럼: {selected_col}")
+                        else:
+                            st.info("표시할 컬럼 이름이 없습니다.")
                     elif "node_error" in metadata:
                         st.caption(f"⚠️ {metadata['node_error']}")
+                    else:
+                        st.info("컬럼 정보를 가져올 수 없습니다.")
             else:
                 st.info("No tables available.")
 
