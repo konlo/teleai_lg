@@ -221,10 +221,10 @@ def _render_visualizations(message_index: int) -> None:
     code_blocks = st.session_state.get("visualization_codes", {})
     graphviz_blocks = st.session_state.get("visualization_graphs", {})
     messages = st.session_state.get("visualization_messages", {})
-    for code in code_blocks.get(message_index, []):
-        st.code(code, language="python")
-    for code in graphviz_blocks.get(message_index, []):
-        st.graphviz_chart(code)
+    # for code in code_blocks.get(message_index, []):
+    #     st.code(code, language="python")
+    # for code in graphviz_blocks.get(message_index, []):
+    #     st.graphviz_chart(code)
     for idx, image in enumerate(visualizations.get(message_index, []), start=1):
         caption = f"Visualization result #{idx}"
         st.image(image, caption=caption)
@@ -269,7 +269,7 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
         lang_lower = lang or ""
         lang_lower = lang_lower.lower()
         if lang_lower in {"dot", "graphviz"} or _is_graphviz_code(code):
-            st.graphviz_chart(code)
+            # st.graphviz_chart(code)
             graphs = st.session_state.setdefault("visualization_graphs", {})
             graphs.setdefault(message_index, []).append(code)
             _append_visualization_message(
@@ -301,7 +301,6 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
             )
             continue
         # For Python node_visualization blocks, show the code before execution.
-        st.code(code, language="python")
         codes = st.session_state.setdefault("visualization_codes", {})
         codes.setdefault(message_index, []).append(code)
         try:
