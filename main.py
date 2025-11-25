@@ -38,7 +38,7 @@ SYSTEM_PROMPT = "You are a helpful assistant who keeps answers concise and clear
 # To avoid exceeding provider context limits we only send the most recent
 # portion of the conversation to the LLM. These limits are intentionally
 # conservative because downstream prompts also include table previews and
-# visualization code.
+# node_visualization code.
 MAX_HISTORY_MESSAGES = 12
 MAX_MESSAGE_CHARS = 4000
 TABLE_PREVIEW_LIMIT = 50
@@ -49,55 +49,62 @@ TABLE_LOAD_PATTERN = re.compile(
 LIMIT_DIRECTIVE_PATTERN = re.compile(r"%limit\s+(\d+)", re.IGNORECASE)
 CODE_BLOCK_PATTERN = re.compile(r"```(?P<lang>\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
 # Replace JSON-style literals with Python equivalents when the LLM emits
-# visualization code snippets. This avoids NameError when the model returns
+# node_visualization code snippets. This avoids NameError when the model returns
 # data samples containing null/true/false.
 JSON_LITERAL_PATTERN = re.compile(r"\b(null|true|false)\b")
 # Bump this to force Streamlit to rebuild the LangGraph when graph logic changes.
-GRAPH_BUILD_ID = "2024-09-09-a"
+GRAPH_BUILD_ID = "2024-09-09-e"
 LANGGRAPH_NODES = {
-    "extract_user": "대화 내 최신 사용자 질문 추출",
-    "configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
-    "intent_classifier": "질문 의도 분류 (visualize/sql/simple/clarify)",
-    "s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
-    "table_select": "다음 테이블 선택 및 상태 업데이트",
-    "table_sql": "선택된 테이블용 안전한 SQL 생성",
-    "sql_generator": "스키마를 참고해 SQL 생성",
-    "sql_validator": "생성된 SQL 안전성 및 구문 검증",
-    "run_query": "Databricks에서 SQL 실행",
-    "visualization": "쿼리 결과를 이용한 시각화 코드 작성",
-    "table_results": "각 테이블 결과/시각화 누적",
-    "respond_node": "최종 답변/요약 작성",
-    "clarify": "정보가 부족할 때 추가 질문",
-    "error": "쿼리 실패 등 오류 안내",
+    "node_extract_user": "대화 내 최신 사용자 질문 추출",
+    "node_configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
+    "node_intent_classifier": "질문 의도 분류 (visualize/sql/simple/clarify)",
+    "node_s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
+    "node_table_select": "다음 테이블 선택 및 상태 업데이트",
+    "node_table_sql": "선택된 테이블용 안전한 SQL 생성",
+    "node_sql_generator": "스키마를 참고해 SQL 생성",
+    "node_sql_validator": "생성된 SQL 안전성 및 구문 검증",
+    "node_run_query": "Databricks에서 SQL 실행",
+    "node_load_data": "쿼리 결과를 로딩 상태로 저장",
+    "node_use_loaded_data": "기존 로딩 데이터로 시각화 준비",
+    "node_visualization": "쿼리 결과를 이용한 시각화 코드 작성",
+    "node_table_results": "각 테이블 결과/시각화 누적",
+    "node_respond": "최종 답변/요약 작성",
+    "node_clarify": "정보가 부족할 때 추가 질문",
+    "node_error": "쿼리 실패 등 오류 안내",
 }
 LANGGRAPH_DOT = """
 digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
-    extract_user -> intent_classifier;
-    intent_classifier -> configure_limits [label="%limit"];
-    configure_limits -> respond_node [label="%limit only"];
-    intent_classifier -> table_select [label="multi-table"];
-    table_select -> table_sql -> run_query;
-    intent_classifier -> s2w_tool [label="visualize/sql ready"];
-    s2w_tool -> sql_generator;
-    intent_classifier -> clarify [label="clarify"];
-    intent_classifier -> respond_node [label="simple"];
-    sql_generator -> sql_validator;
-    sql_validator -> sql_generator [label="retry"];
-    sql_validator -> run_query [label="pass"];
-    sql_validator -> error [label="max fail"];
-    run_query -> visualization [label="visualize"];
-    run_query -> table_results [label="multi-table"];
-    run_query -> respond_node [label="sql only"];
-    run_query -> error [label="error"];
-    visualization -> table_results [label="multi-table"];
-    visualization -> respond_node;
-    table_results -> table_select [label="next"];
-    table_results -> respond_node [label="done"];
-    clarify -> end;
-    respond_node -> end;
-    error -> end;
+    node_extract_user -> node_intent_classifier;
+    node_intent_classifier -> node_configure_limits [label="%limit"];
+    node_configure_limits -> node_respond [label="%limit only"];
+    node_intent_classifier -> node_table_select [label="multi-table"];
+    node_table_select -> node_table_sql -> node_run_query;
+    node_intent_classifier -> node_s2w_tool [label="visualize/sql/loading"];
+    node_intent_classifier -> node_use_loaded_data [label="visualize+cached"];
+    node_s2w_tool -> node_sql_generator [label="ok"];
+    node_s2w_tool -> node_error [label="meta error"];
+    node_intent_classifier -> node_clarify [label="clarify"];
+    node_intent_classifier -> node_respond [label="simple"];
+    node_sql_generator -> node_sql_validator;
+    node_sql_validator -> node_sql_generator [label="retry"];
+    node_sql_validator -> node_run_query [label="pass"];
+    node_sql_validator -> node_error [label="max fail"];
+    node_run_query -> node_visualization [label="visualize"];
+    node_run_query -> node_table_results [label="multi-table"];
+    node_run_query -> node_load_data [label="loading"];
+    node_run_query -> node_respond [label="sql only"];
+    node_run_query -> node_error [label="error"];
+    node_use_loaded_data -> node_visualization;
+    node_visualization -> node_table_results [label="multi-table"];
+    node_load_data -> node_respond [label="done"];
+    node_visualization -> node_respond;
+    node_table_results -> node_table_select [label="next"];
+    node_table_results -> node_respond [label="done"];
+    node_clarify -> end;
+    node_respond -> end;
+    node_error -> end;
 }
 """
 
@@ -192,7 +199,12 @@ def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = N
             details += f" (line {exc.lineno})"
         raise SyntaxError(details) from exc
     after = set(plt.get_fignums())
-    new_figs = [plt.figure(num) for num in sorted(after - before)]
+    new_fig_nums = sorted(after - before)
+    new_figs = [plt.figure(num) for num in new_fig_nums]
+    # If no new figure IDs but there is at least one active figure, reuse the latest one.
+    if not new_figs and after:
+        latest_num = max(after)
+        new_figs = [plt.figure(latest_num)]
     images: List[bytes] = []
     for fig in new_figs:
         buffer = io.BytesIO()
@@ -204,16 +216,22 @@ def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = N
 
 
 def _render_visualizations(message_index: int) -> None:
-    """Show stored visualization outputs for a conversation turn."""
+    """Show stored node_visualization outputs for a conversation turn."""
     visualizations = st.session_state.get("visualizations", {})
+    code_blocks = st.session_state.get("visualization_codes", {})
+    graphviz_blocks = st.session_state.get("visualization_graphs", {})
     messages = st.session_state.get("visualization_messages", {})
+    for code in code_blocks.get(message_index, []):
+        st.code(code, language="python")
+    for code in graphviz_blocks.get(message_index, []):
+        st.graphviz_chart(code)
     for idx, image in enumerate(visualizations.get(message_index, []), start=1):
         caption = f"Visualization result #{idx}"
         st.image(image, caption=caption)
     for entry in messages.get(message_index, []):
         level = entry.get("level", "info")
         text = entry.get("text", "")
-        if level == "error":
+        if level == "node_error":
             st.error(text)
         elif level == "warning":
             st.warning(text)
@@ -244,11 +262,16 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
         table_outputs = viz_tables_by_msg.get(message_index) or []
         if table_outputs:
             rows_for_msg = table_outputs[0].get("rows") or []
+    # Fall back to globally cached loaded data when no rows are attached to this message.
+    if not rows_for_msg:
+        rows_for_msg = st.session_state.get("state_loaded_data") or []
     for idx, (lang, code) in enumerate(code_blocks, start=1):
         lang_lower = lang or ""
         lang_lower = lang_lower.lower()
         if lang_lower in {"dot", "graphviz"} or _is_graphviz_code(code):
             st.graphviz_chart(code)
+            graphs = st.session_state.setdefault("visualization_graphs", {})
+            graphs.setdefault(message_index, []).append(code)
             _append_visualization_message(
                 message_index, "info", f"Code block {idx} Graphviz 렌더링 완료.")
             continue
@@ -268,20 +291,24 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
             )
             continue
         if not lang_lower:
-            st.code(code)
+            # Treat language-omitted blocks as Python for node_visualization.
+            lang_lower = "python"
+        if lang_lower and lang_lower != "python":
             _append_visualization_message(
                 message_index,
-                "info",
-                f"Code block {idx}은 언어 미지정 블록이라 실행하지 않았어요.",
+                "warning",
+                f"Code block {idx}은 지원되지 않는 언어({lang})라 실행하지 않았어요.",
             )
             continue
-        # For Python visualization blocks, show the code before execution.
+        # For Python node_visualization blocks, show the code before execution.
         st.code(code, language="python")
+        codes = st.session_state.setdefault("visualization_codes", {})
+        codes.setdefault(message_index, []).append(code)
         try:
             images = _execute_visualization_code(code, rows_for_msg)
         except Exception as exc:  # pragma: no cover - Streamlit surface
             _append_visualization_message(
-                message_index, "error", f"⚠️ Code block {idx} 실행 중 오류: {exc}"
+                message_index, "node_error", f"⚠️ Code block {idx} 실행 중 오류: {exc}"
             )
             continue
         if images:
@@ -356,12 +383,20 @@ def main() -> None:
         st.session_state.visualizations = {}
     if "visualization_messages" not in st.session_state:
         st.session_state.visualization_messages = {}
-    if "table_metadata" not in st.session_state:
-        st.session_state.table_metadata = {}
+    if "state_table_metadata" not in st.session_state:
+        st.session_state.state_table_metadata = {}
+    if "state_active_table_metadata" not in st.session_state:
+        st.session_state.state_active_table_metadata = {}
+    if "state_loaded_data" not in st.session_state:
+        st.session_state.state_loaded_data = []
+    if "state_loaded_columns" not in st.session_state:
+        st.session_state.state_loaded_columns = []
+    if "state_loaded_table" not in st.session_state:
+        st.session_state.state_loaded_table = ""
     if "node_paths" not in st.session_state:
         st.session_state.node_paths = {}
-    if "sql_limit" not in st.session_state:
-        st.session_state.sql_limit = DEFAULT_SQL_LIMIT
+    if "state_sql_limit" not in st.session_state:
+        st.session_state.state_sql_limit = DEFAULT_SQL_LIMIT
 
     with st.sidebar:
         provider = os.environ.get("LLM_PROVIDER", "google").lower()
@@ -390,7 +425,7 @@ def main() -> None:
             if refresh_requested:
                 st.session_state.pop("tables", None)
                 st.session_state.pop("tables_error", None)
-                st.session_state.pop("table_metadata", None)
+                st.session_state.pop("state_table_metadata", None)
             if "tables" not in st.session_state and "tables_error" not in st.session_state:
                 try:
                     st.session_state.tables = list_tables()
@@ -399,8 +434,8 @@ def main() -> None:
                         try:
                             metadata[name] = fetch_table_metadata(name)
                         except Exception as meta_exc:
-                            metadata[name] = {"error": str(meta_exc)}
-                    st.session_state.table_metadata = metadata
+                            metadata[name] = {"node_error": str(meta_exc)}
+                    st.session_state.state_table_metadata = metadata
                 except Exception as exc:  # pragma: no cover - UI path
                     st.session_state.tables_error = str(exc)
 
@@ -410,7 +445,7 @@ def main() -> None:
             if tables_error:
                 st.warning(tables_error)
             elif tables:
-                table_metadata = st.session_state.get("table_metadata", {})
+                table_metadata = st.session_state.get("state_table_metadata", {})
                 for name in tables:
                     st.write(f"- {name}")
                     metadata = table_metadata.get(name, {})
@@ -420,8 +455,8 @@ def main() -> None:
                             f"{col['name']} ({col['type']})" for col in columns
                         )
                         st.caption(schema_text)
-                    elif "error" in metadata:
-                        st.caption(f"⚠️ {metadata['error']}")
+                    elif "node_error" in metadata:
+                        st.caption(f"⚠️ {metadata['node_error']}")
             else:
                 st.info("No tables available.")
 
@@ -436,7 +471,7 @@ def main() -> None:
             trace_container.info(
                 "StreamlitCallbackHandler를 불러오지 못했습니다. "
                 "langchain 버전을 확인하거나 `pip install langchain` 후 다시 실행해 주세요."
-                f"{f' (import error: {_streamlit_cb_error})' if _streamlit_cb_error else ''}"
+                f"{f' (import node_error: {_streamlit_cb_error})' if _streamlit_cb_error else ''}"
             )
         else:
             trace_container.caption("여기에서 LLM 호출 로그를 확인할 수 있어요.")
@@ -455,7 +490,7 @@ def main() -> None:
         limit_override_match = LIMIT_DIRECTIVE_PATTERN.search(prompt)
         if limit_override_match:
             limit_value = int(limit_override_match.group(1))
-            st.session_state.sql_limit = limit_value
+            st.session_state.state_sql_limit = limit_value
 
         table_names: List[str] = []
         table_matches = [match.group("table") for match in TABLE_LOAD_PATTERN.finditer(prompt)]
@@ -493,38 +528,50 @@ def main() -> None:
                     st.markdown(preview_text)
 
             node_path: List[str] = []
+            response_state: Dict[str, Any] = {}
             try:
                 graph = st.session_state.graph
-                metadata = st.session_state.get("table_metadata", {})
+                metadata = st.session_state.get("state_table_metadata", {})
                 callbacks = []
                 if StreamlitCallbackHandler is not None:
                     callbacks.append(StreamlitCallbackHandler(trace_container))
                 response_state = graph.invoke(
                     {
-                        "messages": _lc_messages(st.session_state.history),
-                        "table_metadata": metadata,
-                        "sql_limit": st.session_state.get("sql_limit", DEFAULT_SQL_LIMIT),
+                        "state_messages": _lc_messages(st.session_state.history),
+                        "state_table_metadata": metadata,
+                        "state_sql_limit": st.session_state.get("state_sql_limit", DEFAULT_SQL_LIMIT),
+                        "state_loaded_data": st.session_state.get("state_loaded_data"),
+                        "state_loaded_columns": st.session_state.get("state_loaded_columns"),
+                        "state_loaded_table": st.session_state.get("state_loaded_table"),
+                        "state_active_table_metadata": st.session_state.get("state_active_table_metadata"),
                     },
                     config={"callbacks": callbacks} if callbacks else None,
                 )
-                latest = response_state["messages"][-1]
+                latest = response_state["state_messages"][-1]
                 response_text = latest["content"]
-                node_path = response_state.get("node_path", [])
-                st.session_state.sql_limit = response_state.get(
-                    "sql_limit", DEFAULT_SQL_LIMIT
+                node_path = response_state.get("state_node_path", [])
+                st.session_state.state_sql_limit = response_state.get(
+                    "state_sql_limit", DEFAULT_SQL_LIMIT
                 )
             except Exception as exc:  # pragma: no cover - Streamlit surface
                 response_text = f"⚠️ Error: {exc}"
+                response_state = {}
             assistant_segments.append(response_text)
             combined_text = "\n\n".join(segment for segment in assistant_segments if segment)
             st.session_state.history.append(("assistant", combined_text))
             message_index = len(st.session_state.history) - 1
-            # Cache data for visualization execution without embedding it in the code text.
+            # Cache data for node_visualization execution without embedding it in the code text.
             viz_rows = st.session_state.setdefault("viz_rows", {})
-            viz_rows[message_index] = response_state.get("query_result") or []
+            viz_rows[message_index] = response_state.get("state_loaded_data") if response_state else []
             viz_tables = st.session_state.setdefault("viz_table_outputs", {})
-            viz_tables[message_index] = response_state.get("table_outputs") or []
-            if node_path and node_path[-1] == "error":
+            viz_tables[message_index] = response_state.get("state_table_outputs") if response_state else []
+            # Persist loaded data/columns/table across turns for reuse.
+            if response_state:
+                st.session_state.state_loaded_data = response_state.get("state_loaded_data")
+                st.session_state.state_loaded_columns = response_state.get("state_loaded_columns")
+                st.session_state.state_loaded_table = response_state.get("state_loaded_table")
+                st.session_state.state_active_table_metadata = response_state.get("state_active_table_metadata")
+            if node_path and node_path[-1] == "node_error":
                 st.error(response_text)
             else:
                 st.markdown(response_text)
