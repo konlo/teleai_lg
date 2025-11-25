@@ -59,6 +59,7 @@ def format_node_traces(traces: List[Dict[str, Any]] | None) -> str:
     if not traces:
         return ""
     segments: List[str] = ["\n\n노드 입출력 기록"]
+    # 2025.11.25 konlo.na off 시킴
     # for trace in traces:
     #     node_name = trace.get("node", "unknown")
     #     segments.append(f"\n[{node_name}] 입력:")
