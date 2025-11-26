@@ -64,6 +64,10 @@ class AgentState(TypedDict, total=False):
     state_table_metadata: Dict[str, Any]
     state_user_query: str
     state_clean_user_query: str
+    state_visualization_mode: Literal["raw_detail", "sql_aggregate", "ambiguous"]
+    state_visualization_mode_reason: str
+    state_require_mode_confirmation: bool
+    state_size_guardrail_triggered: bool
     state_intent: AgentIntent
     state_sql_query: str
     state_sql_validation_error: str
@@ -95,6 +99,49 @@ LIMIT_DIRECTIVE_PATTERN = re.compile(r"%limit\s+(\d+)", re.IGNORECASE)
 LOADING_DIRECTIVE_PATTERN = re.compile(r"%loading\b", re.IGNORECASE)
 SQL_VALIDATION_MAX_RETRIES = 2
 DEFAULT_SQL_LIMIT = 500
+AGGREGATE_KEYWORDS = (
+    "평균",
+    "합계",
+    "총",
+    "총합",
+    "top",
+    "top ",
+    "순위",
+    "랭킹",
+    "비율",
+    "퍼센트",
+    "percent",
+    "ratio",
+    "분포",
+    "distribution",
+    "추세",
+    "trend",
+    "집계",
+    "count",
+    "sum",
+    "avg",
+    "최대",
+    "최소",
+    "상위",
+)
+DETAIL_KEYWORDS = (
+    "모든 데이터",
+    "전체 데이터",
+    "세부",
+    "raw",
+    "원시",
+    "행 단위",
+    "row",
+    "레코드",
+    "필터링",
+    "where",
+    "조건",
+    "시간별",
+    "분 단위",
+    "초 단위",
+    "timestamp",
+)
+ROW_COUNT_GUARDRAIL = 1_000_000
 
 
 def _latest_limit_override(messages: List[ChatMessage]) -> int | None:
@@ -117,7 +164,11 @@ def _select_relevant_metadata(
     return select_relevant_metadata(user_query, table_metadata, MAX_MULTI_TABLES, MULTI_TABLE_KEYWORDS)
 
 
-def _s2w_tool_description(limit: int, table_metadata: Dict[str, Any] | None = None) -> str:
+def _s2w_tool_description(
+    limit: int,
+    table_metadata: Dict[str, Any] | None = None,
+    mode: str | None = None,
+) -> str:
     schema_context = _format_schema_context(table_metadata)
     clauses = [
         "Tool name: s2w (Safe-to-Visualize SQL Writer).",
@@ -130,6 +181,14 @@ def _s2w_tool_description(limit: int, table_metadata: Dict[str, Any] | None = No
         "- Keep the statement single-query and free of DDL/DML.",
         "- Use the fully-qualified table names exactly as listed below; do not invent or change catalogs/schemas.",
     ]
+    if mode == "sql_aggregate":
+        clauses.append(
+            "- Favor GROUP BY + aggregates over raw rows to keep the result compact (e.g., counts, sums, averages)."
+        )
+    elif mode == "raw_detail":
+        clauses.append(
+            "- The user needs row-level detail; keep WHERE filters explicit and avoid unnecessary aggregates."
+        )
     description = "\n".join(clauses)
     if schema_context:
         description = f"{description}\n\n{schema_context}"
@@ -144,6 +203,49 @@ def _latest_user_query(messages: List[ChatMessage]) -> str:
         if message["role"] == "user":
             return message["content"]
     return ""
+
+
+def _estimate_row_count(table_metadata: Dict[str, Any] | None) -> int | None:
+    if not table_metadata:
+        return None
+    estimates: List[int] = []
+    for meta in table_metadata.values():
+        if not isinstance(meta, dict):
+            continue
+        for key in ("row_count", "rows", "estimated_rows", "approx_row_count", "approx_rows"):
+            value = meta.get(key)
+            if isinstance(value, (int, float)):
+                try:
+                    estimates.append(int(value))
+                except Exception:
+                    continue
+    if not estimates:
+        return None
+    return max(estimates)
+
+
+def _infer_visualization_mode(
+    user_query: str,
+    table_metadata: Dict[str, Any] | None,
+    limit: int | None = None,
+) -> Tuple[Literal["raw_detail", "sql_aggregate", "ambiguous"], str, bool]:
+    normalized = (user_query or "").lower()
+    agg_hits = [kw for kw in AGGREGATE_KEYWORDS if kw.lower() in normalized]
+    detail_hits = [kw for kw in DETAIL_KEYWORDS if kw.lower() in normalized]
+    estimated_rows = _estimate_row_count(table_metadata)
+    guardrail = bool(estimated_rows and estimated_rows >= ROW_COUNT_GUARDRAIL)
+    if guardrail:
+        reason = f"추정 행 수 {estimated_rows:,}행 이상으로 감지되어 집계/요약 모드가 안전합니다."
+        return "sql_aggregate", reason, True
+    if agg_hits and len(agg_hits) >= len(detail_hits):
+        keywords = ", ".join(sorted(set(agg_hits)))
+        return "sql_aggregate", f"집계/랭킹 관련 키워드 감지: {keywords}", False
+    if detail_hits and len(detail_hits) > len(agg_hits):
+        keywords = ", ".join(sorted(set(detail_hits)))
+        return "raw_detail", f"세부/행 기반 키워드 감지: {keywords}", False
+    if limit and limit <= 20000 and not agg_hits:
+        return "raw_detail", f"LIMIT {limit} 기반 세부 샘플링 요청으로 추정", False
+    return "ambiguous", "세부 vs 집계 의도가 불분명해 확인이 필요합니다.", False
 
 
 def build_conversation_graph(provider: str | None = None):
@@ -203,16 +305,41 @@ def build_conversation_graph(provider: str | None = None):
     def fn_classify_intent(state: AgentState) -> AgentState:
         query = state.get("state_clean_user_query") or state.get("state_user_query", "")
         limit_only = state.get("state_limit_requested") and not (state.get("state_clean_user_query") or "").strip()
+        default_mode_state: AgentState = {
+            "state_visualization_mode": "",
+            "state_visualization_mode_reason": "",
+            "state_require_mode_confirmation": False,
+            "state_size_guardrail_triggered": False,
+        }
         if limit_only:
-            return with_path(state, "node_intent_classifier", {"state_intent": "simple_answer"})
+            updates: AgentState = {"state_intent": "simple_answer"}
+            updates.update(default_mode_state)
+            return with_path(state, "node_intent_classifier", updates)
         if not query:
-            return with_path(state, "node_intent_classifier", {"state_intent": "simple_answer"})
+            updates: AgentState = {"state_intent": "simple_answer"}
+            updates.update(default_mode_state)
+            return with_path(state, "node_intent_classifier", updates)
 
         system_prompt = "You categorize user requests for a Databricks analytics assistant."
         user_prompt = f"User query:\n{query}"
         try:
             parsed = _call_structured_llm(selected, system_prompt, user_prompt, Intent)
-            return with_path(state, "node_intent_classifier", {"state_intent": parsed.intent})
+            updates: AgentState = {"state_intent": parsed.intent}
+            updates.update(default_mode_state)
+            if parsed.intent == "visualize":
+                limit_hint = state.get("state_sql_limit") or DEFAULT_SQL_LIMIT
+                mode, reason, guardrail = _infer_visualization_mode(
+                    query, state.get("state_table_metadata"), limit_hint
+                )
+                updates.update(
+                    {
+                        "state_visualization_mode": mode,
+                        "state_visualization_mode_reason": reason,
+                        "state_require_mode_confirmation": mode == "ambiguous" or guardrail,
+                        "state_size_guardrail_triggered": guardrail,
+                    }
+                )
+            return with_path(state, "node_intent_classifier", updates)
         except Exception as exc:  # Includes JSON decoding and Pydantic validation errors
             error_details = f"{exc.__class__.__name__}: {exc}"
             print(f"[intent] Intent classification failed: {error_details}")
@@ -222,6 +349,7 @@ def build_conversation_graph(provider: str | None = None):
                 {
                     "state_intent": "simple_answer",
                     "state_error_message": f"의도 분류 실패: {error_details}",
+                    **default_mode_state,
                 },
             )
 
@@ -243,7 +371,9 @@ def build_conversation_graph(provider: str | None = None):
                     }
                 )
                 return with_path(state, "node_s2w_tool", updates)
-        tool_description = _s2w_tool_description(limit, relevant_meta)
+        tool_description = _s2w_tool_description(
+            limit, relevant_meta, state.get("state_visualization_mode")
+        )
         updates.update(
             {
                 "state_sql_tool_description": tool_description,
@@ -262,7 +392,9 @@ def build_conversation_graph(provider: str | None = None):
         retry_count = state.get("state_sql_retry_count", 0)
         limit = state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
         system_prompt = _s2w_tool_description(
-            limit, state.get("state_active_table_metadata") or state.get("state_table_metadata")
+            limit,
+            state.get("state_active_table_metadata") or state.get("state_table_metadata"),
+            state.get("state_visualization_mode"),
         )
         tool_details = state.get("state_sql_tool_description")
         if tool_details:
@@ -518,6 +650,17 @@ def build_conversation_graph(provider: str | None = None):
                 reply = _call_llm(selected, system_prompt, user_prompt).strip()
             final_text = reply
 
+        if intent == "visualize":
+            mode = state.get("state_visualization_mode")
+            reason = state.get("state_visualization_mode_reason") or ""
+            if mode in {"raw_detail", "sql_aggregate"}:
+                label = "세부 데이터(행 기반)" if mode == "raw_detail" else "집계/요약(SQL)"
+                reason_text = f" (근거: {reason})" if reason else ""
+                final_text = (
+                    f"{final_text}\n\n모드 안내: 이번 요청은 {label}으로 처리했어요.{reason_text} "
+                    "다른 방식이 필요하면 '세부 데이터로 로딩' 또는 'SQL 집계로 대신 보여줘'라고 알려주세요."
+                )
+
         if visualization_code:
             final_text = f"{final_text}\n\n{visualization_code}"
 
@@ -538,14 +681,30 @@ def build_conversation_graph(provider: str | None = None):
 
     def fn_clarify(state: AgentState) -> AgentState:
         user_query = state.get("state_user_query", "")
-        system_prompt = (
-            "You need more detail from the user before running SQL. "
-            "Ask a short follow-up question in Korean."
-        )
-        user_prompt = (
-            f"User query:\n{user_query}\n\nAsk what detail is missing. "
-            "Populate the `follow_up_question` field."
-        )
+        mode_reason = state.get("state_visualization_mode_reason", "")
+        need_mode_choice = state.get("state_require_mode_confirmation", False)
+        if need_mode_choice:
+            system_prompt = (
+                "You must ask the user to choose between row-level visualization (DataFrame) "
+                "and aggregated SQL summary. Keep it short, Korean, and provide 2 options with examples."
+            )
+            user_prompt = (
+                f"User query:\n{user_query}\n\n"
+                f"Explain why confirmation is needed: {mode_reason or '집계/세부 의도가 혼재되어 있음'}\n"
+                "Offer two choices:\n"
+                "1) 세부 데이터/행 기반 로딩 (예: '지난주 특정 제품의 시간별 판매량 라인차트')\n"
+                "2) 집계/요약 SQL (예: '전체 기간 가장 많이 팔린 제품 TOP 10 막대 그래프', '월별 총 매출 추세')\n"
+                "Ask the user to pick one of the above."
+            )
+        else:
+            system_prompt = (
+                "You need more detail from the user before running SQL. "
+                "Ask a short follow-up question in Korean."
+            )
+            user_prompt = (
+                f"User query:\n{user_query}\n\nAsk what detail is missing. "
+                "Populate the `follow_up_question` field."
+            )
         try:
             structured = _call_structured_llm(
                 selected, system_prompt, user_prompt, ClarificationRequest
@@ -620,6 +779,8 @@ def build_conversation_graph(provider: str | None = None):
             return "node_configure_limits"
         if state.get("state_table_queue"):
             return "node_table_select"
+        if state.get("state_require_mode_confirmation"):
+            return "node_clarify"
         intent = state.get("state_intent", "simple_answer")
         if intent == "visualize":
             user_query = state.get("state_clean_user_query") or state.get("state_user_query", "")
