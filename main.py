@@ -49,61 +49,36 @@ TABLE_LOAD_PATTERN = re.compile(
 )
 LIMIT_DIRECTIVE_PATTERN = re.compile(r"%limit\s+(\d+)", re.IGNORECASE)
 # Bump this to force Streamlit to rebuild the LangGraph when graph logic changes.
-GRAPH_BUILD_ID = "2024-09-09-e"
+GRAPH_BUILD_ID = "2025-03-02-b"
 LANGGRAPH_NODES = {
-    "node_extract_user": "대화 내 최신 사용자 질문 추출",
-    "node_configure_limits": "사용자 %limit 설정을 내부 변수로 반영",
-    "node_intent_classifier": "질문 의도 분류 (visualize/sql/simple/clarify)",
-    "node_s2w_tool": "시각화용 안전 SQL Tool 컨텍스트 준비",
-    "node_table_select": "다음 테이블 선택 및 상태 업데이트",
-    "node_table_sql": "선택된 테이블용 안전한 SQL 생성",
-    "node_sql_generator": "스키마를 참고해 SQL 생성",
-    "node_sql_validator": "생성된 SQL 안전성 및 구문 검증",
-    "node_run_query": "Databricks에서 SQL 실행",
-    "node_load_data": "쿼리 결과를 로딩 상태로 저장",
-    "node_use_loaded_data": "기존 로딩 데이터로 시각화 준비",
-    "node_visualization": "쿼리 결과를 이용한 시각화 코드 작성",
-    "node_table_results": "각 테이블 결과/시각화 누적",
-    "node_respond": "최종 답변/요약 작성",
-    "node_clarify": "정보가 부족할 때 추가 질문",
+    "node_ingest": "질문 추출 + %limit 반영 + 의도 분류",
+    "node_plan_tables": "테이블 큐/스키마 컨텍스트 준비",
+    "node_prepare_sql": "SQL 생성+검증(재시도 포함)",
+    "node_run_query": "Databricks 쿼리 실행 및 누적",
+    "node_visualization": "시각화 코드 생성 및 누적",
+    "node_respond": "최종 답변/요약/추가질문",
     "node_error": "쿼리 실패 등 오류 안내",
 }
 LANGGRAPH_DOT = """
 digraph {
     rankdir=LR;
     node [shape=rectangle, style=rounded];
-    node_extract_user -> node_intent_classifier;
-    node_intent_classifier -> node_configure_limits [label="%limit"];
-    node_configure_limits -> node_respond [label="%limit only"];
-    node_intent_classifier -> node_table_select [label="multi-table"];
-    node_table_select -> node_table_sql -> node_run_query;
-    node_intent_classifier -> node_s2w_tool [label="visualize/sql/loading"];
-    node_intent_classifier -> node_use_loaded_data [label="visualize+cached"];
-    node_s2w_tool -> node_sql_generator [label="ok"];
-    node_s2w_tool -> node_error [label="meta error"];
-    node_intent_classifier -> node_clarify [label="clarify"];
-    node_intent_classifier -> node_respond [label="simple"];
-    node_sql_generator -> node_sql_validator;
-    node_sql_validator -> node_sql_generator [label="retry"];
-    node_sql_validator -> node_run_query [label="pass"];
-    node_sql_validator -> node_error [label="max fail"];
+    node_ingest -> node_plan_tables [label="visualize/sql/loading"];
+    node_ingest -> node_respond [label="simple/%limit/clarify"];
+    node_plan_tables -> node_prepare_sql;
+    node_plan_tables -> node_error [label="meta error"];
+    node_prepare_sql -> node_run_query [label="pass"];
+    node_prepare_sql -> node_error [label="max fail"];
     node_run_query -> node_visualization [label="visualize"];
-    node_run_query -> node_table_results [label="multi-table"];
-    node_run_query -> node_load_data [label="loading"];
-    node_run_query -> node_respond [label="sql only"];
-    node_run_query -> node_error [label="error"];
-    node_use_loaded_data -> node_visualization;
-    node_visualization -> node_table_results [label="multi-table"];
-    node_load_data -> node_respond [label="done"];
+    node_run_query -> node_plan_tables [label="multi-next"];
+    node_run_query -> node_respond [label="sql/loading"];
+    node_run_query -> node_error [label="runtime"];
+    node_visualization -> node_plan_tables [label="multi-next"];
     node_visualization -> node_respond;
-    node_table_results -> node_table_select [label="next"];
-    node_table_results -> node_respond [label="done"];
-    node_clarify -> end;
     node_respond -> end;
     node_error -> end;
 }
 """
-
 
 def _find_table_references(prompt: str, candidates: Iterable[str]) -> List[str]:
     """Return all candidate tables mentioned in the prompt (case-insensitive)."""

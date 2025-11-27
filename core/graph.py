@@ -265,66 +265,56 @@ def build_conversation_graph(provider: str | None = None):
         _log_node_io(node_name, input_snapshot, output_snapshot, merged_state)
         return payload
 
-    def fn_extract_user_query(state: AgentState) -> AgentState:
+    # ----------------------
+    # Compact node functions
+    # ----------------------
+
+    def fn_ingest(state: AgentState) -> AgentState:
+        """Extract latest user query, apply %limit, and classify intent in one step."""
         query = _latest_user_query(state.get("state_messages", []))
         cleaned_query = re.sub(LIMIT_DIRECTIVE_PATTERN, "", query or "", count=1).strip()
         limit_requested = bool(LIMIT_DIRECTIVE_PATTERN.search(query or ""))
         loading_requested = bool(LOADING_DIRECTIVE_PATTERN.search(query or "")) or bool(
             re.search(r"로딩해줘|로딩해|loading\s*해줘|loading", (query or ""), re.IGNORECASE)
         )
-        return with_path(
-            state,
-            "node_extract_user",
-            {
-                "state_user_query": query,
-                "state_clean_user_query": cleaned_query,
-                "state_sql_tool_active": False,
-                "state_limit_requested": limit_requested,
-                "state_loading_requested": loading_requested,
-            },
-        )
-
-    def fn_configure_limits(state: AgentState) -> AgentState:
         messages = state.get("state_messages", [])
-        limit = state.get("state_sql_limit") or DEFAULT_SQL_LIMIT
+        limit = state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
         override = _latest_limit_override(messages)
         if override is not None:
             limit = override
-        user_query = state.get("state_user_query", "")
-        cleaned_query = (state.get("state_clean_user_query") or "").strip()
-        limit_only = bool(LIMIT_DIRECTIVE_PATTERN.search(user_query)) and not cleaned_query
-        return with_path(
-            state,
-            "node_configure_limits",
-            {
-                "state_sql_limit": limit,
-                "state_limit_only": limit_only,
-            },
-        )
-
-    def fn_classify_intent(state: AgentState) -> AgentState:
-        query = state.get("state_clean_user_query") or state.get("state_user_query", "")
-        limit_only = state.get("state_limit_requested") and not (state.get("state_clean_user_query") or "").strip()
+        limit_only = limit_requested and not cleaned_query
         default_mode_state: AgentState = {
             "state_visualization_mode": "",
             "state_visualization_mode_reason": "",
             "state_require_mode_confirmation": False,
             "state_size_guardrail_triggered": False,
         }
-        if limit_only:
-            updates: AgentState = {"state_intent": "simple_answer"}
-            updates.update(default_mode_state)
-            return with_path(state, "node_intent_classifier", updates)
-        if not query:
-            updates: AgentState = {"state_intent": "simple_answer"}
-            updates.update(default_mode_state)
-            return with_path(state, "node_intent_classifier", updates)
+        if limit_only or not query:
+            updates: AgentState = {
+                "state_user_query": query,
+                "state_clean_user_query": cleaned_query,
+                "state_sql_limit": limit,
+                "state_limit_only": limit_only,
+                "state_limit_requested": limit_requested,
+                "state_loading_requested": loading_requested,
+                "state_intent": "simple_answer",
+                **default_mode_state,
+            }
+            return with_path(state, "node_ingest", updates)
 
         system_prompt = "You categorize user requests for a Databricks analytics assistant."
         user_prompt = f"User query:\n{query}"
         try:
             parsed = _call_structured_llm(selected, system_prompt, user_prompt, Intent)
-            updates: AgentState = {"state_intent": parsed.intent}
+            updates: AgentState = {
+                "state_intent": parsed.intent,
+                "state_user_query": query,
+                "state_clean_user_query": cleaned_query,
+                "state_sql_limit": limit,
+                "state_limit_only": limit_only,
+                "state_limit_requested": limit_requested,
+                "state_loading_requested": loading_requested,
+            }
             updates.update(default_mode_state)
             if parsed.intent == "visualize":
                 limit_hint = state.get("state_sql_limit") or DEFAULT_SQL_LIMIT
@@ -339,142 +329,128 @@ def build_conversation_graph(provider: str | None = None):
                         "state_size_guardrail_triggered": guardrail,
                     }
                 )
-            return with_path(state, "node_intent_classifier", updates)
+            return with_path(state, "node_ingest", updates)
         except Exception as exc:  # Includes JSON decoding and Pydantic validation errors
             error_details = f"{exc.__class__.__name__}: {exc}"
             print(f"[intent] Intent classification failed: {error_details}")
+            updates: AgentState = {
+                "state_intent": "simple_answer",
+                "state_error_message": f"의도 분류 실패: {error_details}",
+                **default_mode_state,
+            }
+            updates.update(
+                {
+                    "state_user_query": query,
+                    "state_clean_user_query": cleaned_query,
+                    "state_sql_limit": limit,
+                    "state_limit_only": limit_only,
+                    "state_limit_requested": limit_requested,
+                    "state_loading_requested": loading_requested,
+                }
+            )
+            return with_path(state, "node_ingest", updates)
+
+    def fn_plan_tables(state: AgentState) -> AgentState:
+        """Only manage table queue/selection and build tool context."""
+        user_query = state.get("state_clean_user_query") or state.get("state_user_query", "")
+        metadata = state.get("state_table_metadata") or {}
+        table_queue = list(state.get("state_table_queue") or [])
+        current_table = state.get("state_current_table", "")
+        active_meta = state.get("state_active_table_metadata") or {}
+        loaded_table = state.get("state_loaded_table", "")
+        if not current_table and table_queue:
+            current_table = table_queue.pop(0)
+        if not current_table and metadata:
+            candidates = resolve_table_sequence(None, user_query, metadata, MAX_MULTI_TABLES, MULTI_TABLE_KEYWORDS)
+            if candidates:
+                current_table = candidates[0]
+                table_queue = candidates[1:]
+        if current_table and metadata:
+            meta = metadata.get(current_table, {})
+            active_meta = {current_table: meta}
+        if not active_meta and loaded_table and loaded_table in metadata:
+            active_meta = {loaded_table: metadata[loaded_table]}
+            current_table = current_table or loaded_table
+        if not active_meta:
+            active_meta = _select_relevant_metadata(user_query, metadata, MAX_MULTI_TABLES, MULTI_TABLE_KEYWORDS)
+        if metadata and not active_meta and not state.get("state_loaded_data"):
             return with_path(
                 state,
-                "node_intent_classifier",
-                {
-                    "state_intent": "simple_answer",
-                    "state_error_message": f"의도 분류 실패: {error_details}",
-                    **default_mode_state,
-                },
+                "node_plan_tables",
+                {"state_error_message": "요청한 테이블 메타데이터를 찾을 수 없습니다."},
             )
-
-    def fn_prepare_s2w_tool_context(state: AgentState) -> AgentState:
         limit = state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
-        user_query = state.get("state_user_query", "")
-        metadata = state.get("state_table_metadata") or {}
-        relevant_meta = _select_relevant_metadata(user_query, metadata)
-        updates: AgentState = {"state_active_table_metadata": relevant_meta}
-        if metadata and not relevant_meta:
-            if state.get("state_intent") == "visualize" and state.get("state_loaded_data"):
-                updates["state_active_table_metadata"] = {}
-            else:
-                updates.update(
-                    {
-                        "state_sql_validation_error": "요청한 테이블 메타데이터를 찾을 수 없습니다.",
-                        "state_sql_retry_count": SQL_VALIDATION_MAX_RETRIES,
-                        "state_error_message": "요청한 테이블 메타데이터를 찾을 수 없습니다.",
-                    }
-                )
-                return with_path(state, "node_s2w_tool", updates)
-        tool_description = _s2w_tool_description(
-            limit, relevant_meta, state.get("state_visualization_mode")
-        )
-        updates.update(
-            {
-                "state_sql_tool_description": tool_description,
-                "state_sql_tool_active": True,
-            }
-        )
-        return with_path(
-            state,
-            "node_s2w_tool",
-            updates,
-        )
+        updates: AgentState = {
+            "state_active_table_metadata": active_meta,
+            "state_table_queue": table_queue,
+            "state_current_table": current_table,
+            "state_sql_tool_description": _s2w_tool_description(
+                limit, active_meta or metadata, state.get("state_visualization_mode")
+            ),
+            "state_sql_tool_active": True,
+        }
+        return with_path(state, "node_plan_tables", updates)
 
-    def fn_generate_sql(state: AgentState) -> AgentState:
+    def fn_prepare_sql(state: AgentState) -> AgentState:
+        """Generate and validate SQL with internal retry loop."""
         query = state.get("state_clean_user_query") or state.get("state_user_query", "")
-        feedback = state.get("state_sql_validation_error")
-        retry_count = state.get("state_sql_retry_count", 0)
         limit = state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
-        system_prompt = _s2w_tool_description(
+        tool_prompt = state.get("state_sql_tool_description") or _s2w_tool_description(
             limit,
             state.get("state_active_table_metadata") or state.get("state_table_metadata"),
             state.get("state_visualization_mode"),
         )
-        tool_details = state.get("state_sql_tool_description")
-        if tool_details:
-            system_prompt = tool_details
-        user_prompt = (
-            f"User request:\n{query}\n\n"
-            "Populate the `sql` field with the final SQL query."
-        )
-        if limit:
-            user_prompt += f"\nUse an explicit LIMIT {limit} (do not pick a smaller value)."
-        if feedback:
-            user_prompt += (
-                "\n\nA previous attempt failed automatic validation for this reason:\n"
-                f"{feedback}\n"
-                "Revise the SQL accordingly and ensure only one SELECT statement is returned."
-            )
-        if retry_count:
-            user_prompt += f"\n(Attempt #{retry_count + 1} — pay extra attention to syntax.)"
-        try:
-            structured = _call_structured_llm(
-                selected, system_prompt, user_prompt, GeneratedSQL
-            )
-            raw_sql = structured.sql.strip()
-        except Exception:
-            raw_sql = _call_llm(selected, system_prompt, user_prompt).strip()
-        sql = _strip_code_block(raw_sql)
-        return with_path(state, "node_sql_generator", {"state_sql_query": sql})
+        sql: str = state.get("state_sql_query", "")
+        error_message = ""
 
-    def fn_select_next_table(state: AgentState) -> AgentState:
-        queue = list(state.get("state_table_queue") or [])
-        updates: AgentState = {}
-        if not queue:
-            updates["state_current_table"] = ""
-            return with_path(
-                state, "node_table_select", updates
-            )
-        current = queue.pop(0)
-        updates["state_current_table"] = current
-        updates["state_table_queue"] = queue
-        updates["state_sql_query"] = ""
-        updates["state_sql_validation_error"] = ""
-        updates["state_sql_retry_count"] = 0
-        updates["state_sql_tool_active"] = False
-        return with_path(state, "node_table_select", updates)
+        for attempt in range(SQL_VALIDATION_MAX_RETRIES + 1):
+            if not sql:
+                feedback = state.get("state_sql_validation_error") if attempt else ""
+                user_prompt = (
+                    f"User request:\n{query}\n\n"
+                    "Populate the `sql` field with the final SQL query."
+                )
+                if limit:
+                    user_prompt += f"\nUse an explicit LIMIT {limit} (do not pick a smaller value)."
+                if feedback:
+                    user_prompt += (
+                        "\n\nA previous attempt failed automatic validation for this reason:\n"
+                        f"{feedback}\n"
+                        "Revise the SQL accordingly and ensure only one SELECT statement is returned."
+                    )
+                if attempt:
+                    user_prompt += f"\n(Attempt #{attempt + 1} — pay extra attention to syntax.)"
+                try:
+                    structured = _call_structured_llm(
+                        selected, tool_prompt, user_prompt, GeneratedSQL
+                    )
+                    raw_sql = structured.sql.strip()
+                except Exception:
+                    raw_sql = _call_llm(selected, tool_prompt, user_prompt).strip()
+                sql = _strip_code_block(raw_sql)
 
-    def fn_build_table_sql(state: AgentState) -> AgentState:
-        table_name = state.get("state_current_table")
-        if not table_name:
-            return with_path(
-                state, "node_table_sql", {"state_error_message": "순차적으로 조회할 테이블이 없습니다."}
+            validation_error = validate_sql_statement(
+                sql,
+                max_limit=limit if state.get("state_sql_tool_active") else None,
+                require_where=bool(state.get("state_sql_tool_active")),
+                table_metadata=state.get("state_active_table_metadata") or state.get("state_table_metadata"),
             )
-        metadata = (state.get("state_table_metadata") or {}).get(table_name, {})
-        limit = metadata.get("preview_limit") or MULTI_TABLE_SAMPLE_LIMIT
-        if not isinstance(limit, int) or limit <= 0:
-            limit = MULTI_TABLE_SAMPLE_LIMIT
-        full_name = table_full_name(table_name, metadata)
-        statement = f"SELECT * FROM {full_name} LIMIT {limit}"
-        return with_path(state, "node_table_sql", {"state_sql_query": statement})
+            if not validation_error:
+                break
+            if attempt >= SQL_VALIDATION_MAX_RETRIES:
+                error_message = f"SQL 검증 실패: {validation_error}"
+                break
+            sql = ""
+            state["state_sql_validation_error"] = validation_error
 
-    def fn_validate_sql(state: AgentState) -> AgentState:
-        statement = state.get("state_sql_query", "")
-        max_limit = state.get("state_sql_limit") if state.get("state_sql_tool_active") else None
-        require_where = bool(state.get("state_sql_tool_active"))
-        validation_error = validate_sql_statement(
-            statement,
-            max_limit=max_limit,
-            require_where=require_where,
-            table_metadata=state.get("state_active_table_metadata") or state.get("state_table_metadata"),
-        )
-        retries = state.get("state_sql_retry_count", 0)
-        updates: AgentState = {}
-        if validation_error:
-            retries += 1
-            updates["state_sql_validation_error"] = validation_error
-            updates["state_sql_retry_count"] = retries
-            if retries >= SQL_VALIDATION_MAX_RETRIES:
-                updates["state_error_message"] = f"SQL 검증 실패: {validation_error}"
-        else:
-            updates["state_sql_validation_error"] = ""
-        return with_path(state, "node_sql_validator", updates)
+        updates: AgentState = {
+            "state_sql_query": sql,
+            "state_error_message": error_message,
+            "state_sql_validation_error": "",
+        }
+        if error_message:
+            updates["state_sql_validation_error"] = error_message
+        return with_path(state, "node_prepare_sql", updates)
 
     def fn_execute_sql(state: AgentState) -> AgentState:
         statement = state.get("state_sql_query", "")
@@ -493,21 +469,25 @@ def build_conversation_graph(provider: str | None = None):
             "state_loaded_columns": list(columns),
             "state_loaded_table": table_name,
         }
+        if state.get("state_intent") != "visualize":
+            outputs = list(state.get("state_table_outputs") or [])
+            if table_name:
+                outputs.append(
+                    {
+                        "table": table_name,
+                        "sql": state.get("state_sql_query", ""),
+                        "row_count": len(rows),
+                        "rows": rows[:20],
+                    }
+                )
+            updates.update(
+                {
+                    "state_table_outputs": outputs,
+                    "state_current_table": "",
+                    "state_table_queue": state.get("state_table_queue") or [],
+                }
+            )
         return with_path(state, "node_run_query", updates)
-
-    def fn_load_data(state: AgentState) -> AgentState:
-        rows = state.get("state_loaded_data", []) or []
-        columns = state.get("state_query_columns") or []
-        table_name = state.get("state_current_table", "") or ""
-        full_meta = state.get("state_table_metadata") or {}
-        selected_meta = {table_name: full_meta[table_name]} if table_name and table_name in full_meta else {}
-        updates: AgentState = {
-            "state_loaded_data": rows,
-            "state_loaded_table": table_name,
-            "state_loaded_columns": list(columns),
-            "state_active_table_metadata": selected_meta,
-        }
-        return with_path(state, "node_load_data", updates)
 
     def fn_plan_visualization(state: AgentState) -> AgentState:
         rows = state.get("state_loaded_data", []) or []
@@ -539,23 +519,28 @@ def build_conversation_graph(provider: str | None = None):
             code = _call_llm(selected, system_prompt, user_prompt).strip()
         clean_code = _strip_code_block(code)
         wrapped = f"```python\n{clean_code}\n```"
-        return with_path(state, "node_visualization", {"state_visualization_code": wrapped})
-
-    def fn_use_loaded_data(state: AgentState) -> AgentState:
-        rows = state.get("state_loaded_data") or []
-        columns = state.get("state_loaded_columns") or []
-        table_name = state.get("state_loaded_table", "")
-        if not rows:
-            return with_path(
-                state,
-                "node_use_loaded_data",
-                {"state_error_message": "로딩된 데이터가 없어 시각화를 진행할 수 없습니다."},
+        updates: AgentState = {"state_visualization_code": wrapped}
+        table_name = state.get("state_current_table", "")
+        outputs = list(state.get("state_table_outputs") or [])
+        viz_blocks = list(state.get("state_visualization_blocks") or [])
+        if table_name:
+            outputs.append(
+                {
+                    "table": table_name,
+                    "sql": state.get("state_sql_query", ""),
+                    "row_count": len(rows),
+                    "rows": rows[:20],
+                }
             )
-        updates: AgentState = {
-            "state_query_columns": columns,
-            "state_current_table": table_name,
-        }
-        return with_path(state, "node_use_loaded_data", updates)
+            viz_blocks.append(f"**{table_name}** 테이블 시각화\n\n{wrapped}")
+            updates["state_current_table"] = ""
+        else:
+            viz_blocks.append(wrapped)
+        updates["state_table_outputs"] = outputs
+        updates["state_visualization_blocks"] = viz_blocks
+        updates["state_visualization_code"] = wrapped
+        updates["state_table_queue"] = state.get("state_table_queue") or []
+        return with_path(state, "node_visualization", updates)
 
     def fn_respond(state: AgentState) -> AgentState:
         intent = state.get("state_intent", "simple_answer")
@@ -567,7 +552,33 @@ def build_conversation_graph(provider: str | None = None):
         loaded_table = state.get("state_loaded_table", "")
         loaded_columns = state.get("state_loaded_columns") or []
         visualization_code = state.get("state_visualization_code")
-        if state.get("state_limit_only"):
+        if state.get("state_require_mode_confirmation") or intent == "clarify":
+            mode_reason = state.get("state_visualization_mode_reason", "")
+            system_prompt = (
+                "You must ask the user to choose between row-level visualization (DataFrame) "
+                "and aggregated SQL summary. Keep it short, Korean, and provide 2 options with examples."
+                if state.get("state_require_mode_confirmation")
+                else "You need more detail from the user before running SQL. Ask a short follow-up question in Korean."
+            )
+            user_prompt = (
+                f"User query:\n{user_query}\n\n"
+                f"Explain why confirmation is needed: {mode_reason or '집계/세부 의도가 혼재되어 있음'}\n"
+                "Offer two choices:\n"
+                "1) 세부 데이터/행 기반 로딩 (예: '지난주 특정 제품의 시간별 판매량 라인차트')\n"
+                "2) 집계/요약 SQL (예: '전체 기간 가장 많이 팔린 제품 TOP 10 막대 그래프', '월별 총 매출 추세')\n"
+                "Ask the user to pick one of the above."
+                if state.get("state_require_mode_confirmation")
+                else f"User query:\n{user_query}\n\nAsk what detail is missing. Populate the `follow_up_question` field."
+            )
+            try:
+                structured = _call_structured_llm(
+                    selected, system_prompt, user_prompt, ClarificationRequest
+                )
+                reply = structured.follow_up_question.strip()
+            except Exception:
+                reply = _call_llm(selected, system_prompt, user_prompt).strip()
+            final_text = reply
+        elif state.get("state_limit_only"):
             limit = state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
             final_text = f"결과 조회 제한을 {limit}행으로 설정했어요. 새로운 요청으로 계속 진행할 수 있어요."
             response_path = list(state.get("state_node_path", [])) + ["node_respond"]
@@ -611,14 +622,15 @@ def build_conversation_graph(provider: str | None = None):
             if visualization_blocks:
                 blocks = "\n\n".join(visualization_blocks)
                 final_text = f"{reply}\n\n{blocks}"
-        elif loaded_rows:
+        elif loaded_rows or loaded_columns:
             count = len(loaded_rows)
             col_count = len(loaded_columns)
             col_list = ", ".join(loaded_columns) if loaded_columns else "N/A"
             table_label = loaded_table or "쿼리 결과"
+            extra_note = "\n조회된 행은 없지만 컬럼 스키마를 먼저 보여드려요." if not loaded_rows else ""
             final_text = (
                 f"`{table_label}` 데이터 {count}행, {col_count}개 컬럼을 로딩했어요.\n"
-                f"컬럼: {col_list}"
+                f"컬럼: {col_list}{extra_note}"
             )
         else:
             rows = state.get("state_loaded_data", []) or []
@@ -679,52 +691,6 @@ def build_conversation_graph(provider: str | None = None):
             },
         )
 
-    def fn_clarify(state: AgentState) -> AgentState:
-        user_query = state.get("state_user_query", "")
-        mode_reason = state.get("state_visualization_mode_reason", "")
-        need_mode_choice = state.get("state_require_mode_confirmation", False)
-        if need_mode_choice:
-            system_prompt = (
-                "You must ask the user to choose between row-level visualization (DataFrame) "
-                "and aggregated SQL summary. Keep it short, Korean, and provide 2 options with examples."
-            )
-            user_prompt = (
-                f"User query:\n{user_query}\n\n"
-                f"Explain why confirmation is needed: {mode_reason or '집계/세부 의도가 혼재되어 있음'}\n"
-                "Offer two choices:\n"
-                "1) 세부 데이터/행 기반 로딩 (예: '지난주 특정 제품의 시간별 판매량 라인차트')\n"
-                "2) 집계/요약 SQL (예: '전체 기간 가장 많이 팔린 제품 TOP 10 막대 그래프', '월별 총 매출 추세')\n"
-                "Ask the user to pick one of the above."
-            )
-        else:
-            system_prompt = (
-                "You need more detail from the user before running SQL. "
-                "Ask a short follow-up question in Korean."
-            )
-            user_prompt = (
-                f"User query:\n{user_query}\n\nAsk what detail is missing. "
-                "Populate the `follow_up_question` field."
-            )
-        try:
-            structured = _call_structured_llm(
-                selected, system_prompt, user_prompt, ClarificationRequest
-            )
-            reply = structured.follow_up_question.strip()
-        except Exception:
-            reply = _call_llm(selected, system_prompt, user_prompt).strip()
-        messages = state.get("state_messages", [])
-        clarify_path = list(state.get("state_node_path", [])) + ["node_clarify"]
-        final_text = f"{reply}{_node_path_diagram(clarify_path)}"
-        final_text = _append_trace_text(final_text, state)
-        return with_path(
-            state,
-            "node_clarify",
-            {
-                "state_response": final_text,
-                "state_messages": messages + [{"role": "assistant", "content": final_text}],
-            },
-        )
-
     def fn_handle_error(state: AgentState) -> AgentState:
         error_message = state.get("state_error_message", "알 수 없는 오류가 발생했습니다.")
         sql_query = state.get("state_sql_query", "")
@@ -747,175 +713,77 @@ def build_conversation_graph(provider: str | None = None):
             },
         )
 
-    def fn_collect_table_results(state: AgentState) -> AgentState:
-        table_name = state.get("state_current_table", "")
-        rows = state.get("state_loaded_data", []) or []
-        visualization_code = state.get("state_visualization_code", "")
-        outputs = list(state.get("state_table_outputs") or [])
-        if table_name:
-            entry = {
-                "table": table_name,
-                "sql": state.get("state_sql_query", ""),
-                "row_count": len(rows),
-                "rows": rows[:20],
-            }
-            outputs.append(entry)
-        viz_blocks = list(state.get("state_visualization_blocks") or [])
-        if visualization_code:
-            labeled_code = visualization_code
-            if table_name:
-                labeled_code = f"**{table_name}** 테이블 시각화\n\n{visualization_code}"
-            viz_blocks.append(labeled_code)
-        updates: AgentState = {
-            "state_table_outputs": outputs,
-            "state_visualization_blocks": viz_blocks,
-            "state_visualization_code": "",
-            "state_current_table": "",
-        }
-        return with_path(state, "node_table_results", updates)
-
-    def fn_route_intent(state: AgentState) -> str:
-        if state.get("state_limit_requested"):
-            return "node_configure_limits"
-        if state.get("state_table_queue"):
-            return "node_table_select"
-        if state.get("state_require_mode_confirmation"):
-            return "node_clarify"
-        intent = state.get("state_intent", "simple_answer")
-        if intent == "visualize":
-            user_query = state.get("state_clean_user_query") or state.get("state_user_query", "")
-            table_meta = state.get("state_table_metadata")
-            relevant = _select_relevant_metadata(user_query, table_meta) if table_meta else {}
-            if state.get("state_loaded_data") and not relevant:
-                return "node_use_loaded_data"
-        if intent in {"visualize", "sql_query"}:
-            return "node_s2w_tool"
-        if state.get("state_loading_requested"):
-            return "node_s2w_tool"
-        if intent == "clarify":
-            return "node_clarify"
+    def fn_route_ingest(state: AgentState) -> str:
+        if state.get("state_limit_only"):
+            return "node_respond"
+        if state.get("state_require_mode_confirmation") or state.get("state_intent") == "clarify":
+            return "node_respond"
+        if state.get("state_intent") in {"visualize", "sql_query"} or state.get("state_loading_requested"):
+            return "node_plan_tables"
         return "node_respond"
 
-    def fn_route_validation(state: AgentState) -> str:
-        if state.get("state_sql_validation_error"):
-            if state.get("state_sql_retry_count", 0) >= SQL_VALIDATION_MAX_RETRIES:
-                return "node_error"
-            return "node_sql_generator"
-        return "node_run_query"
-
-    def fn_route_query(state: AgentState) -> str:
+    def fn_route_plan(state: AgentState) -> str:
         if state.get("state_error_message"):
             return "node_error"
-        if state.get("state_current_table"):
-            if state.get("state_loaded_data"):
-                return "node_visualization"
-            return "node_table_results"
-        if state.get("state_loaded_data") and state.get("state_intent") == "visualize":
-            return "node_use_loaded_data"
-        if state.get("state_loading_requested"):
-            return "node_load_data"
-        if state.get("state_intent") == "visualize" and state.get("state_loaded_data"):
+        return "node_prepare_sql"
+
+    def fn_route_after_prepare(state: AgentState) -> str:
+        if state.get("state_error_message"):
+            return "node_error"
+        return "node_run_query"
+
+    def fn_route_after_execute(state: AgentState) -> str:
+        if state.get("state_error_message"):
+            return "node_error"
+        if state.get("state_intent") == "visualize":
             return "node_visualization"
+        if state.get("state_table_queue"):
+            return "node_plan_tables"
         return "node_respond"
 
     def fn_route_visualization_next(state: AgentState) -> str:
-        if state.get("state_current_table"):
-            return "node_table_results"
-        if state.get("state_loading_requested"):
-            return "node_load_data"
-        return "node_respond"
-
-    def fn_route_table_progress(state: AgentState) -> str:
         if state.get("state_table_queue"):
-            return "node_table_select"
+            return "node_plan_tables"
         return "node_respond"
 
-    def fn_route_s2w(state: AgentState) -> str:
-        if state.get("state_error_message") or state.get("state_sql_validation_error"):
-            return "node_error"
-        return "node_sql_generator"
-
-    def fn_route_limits(state: AgentState) -> str:
-        if state.get("state_limit_only"):
-            return "node_respond"
-        if state.get("state_table_queue"):
-            return "node_table_select"
-        intent = state.get("state_intent", "simple_answer")
-        if intent in {"visualize", "sql_query"}:
-            return "node_s2w_tool"
-        if intent == "clarify":
-            return "node_clarify"
-        return "node_respond"
-
-    workflow.add_node("node_extract_user", fn_extract_user_query)
-    workflow.add_node("node_configure_limits", fn_configure_limits)
-    workflow.add_node("node_intent_classifier", fn_classify_intent)
-    workflow.add_node("node_s2w_tool", fn_prepare_s2w_tool_context)
-    workflow.add_node("node_table_select", fn_select_next_table)
-    workflow.add_node("node_table_sql", fn_build_table_sql)
-    workflow.add_node("node_sql_generator", fn_generate_sql)
-    workflow.add_node("node_sql_validator", fn_validate_sql)
+    workflow.add_node("node_ingest", fn_ingest)
+    workflow.add_node("node_plan_tables", fn_plan_tables)
+    workflow.add_node("node_prepare_sql", fn_prepare_sql)
     workflow.add_node("node_run_query", fn_execute_sql)
-    workflow.add_node("node_use_loaded_data", fn_use_loaded_data)
-    workflow.add_node("node_load_data", fn_load_data)
     workflow.add_node("node_visualization", fn_plan_visualization)
-    workflow.add_node("node_table_results", fn_collect_table_results)
     workflow.add_node("node_respond", fn_respond)
-    workflow.add_node("node_clarify", fn_clarify)
     workflow.add_node("node_error", fn_handle_error)
 
-    workflow.set_entry_point("node_extract_user")
-    workflow.add_edge("node_extract_user", "node_intent_classifier")
+    workflow.set_entry_point("node_ingest")
     workflow.add_conditional_edges(
-        "node_configure_limits",
-        fn_route_limits,
+        "node_ingest",
+        fn_route_ingest,
         {
             "node_respond": "node_respond",
-            "node_table_select": "node_table_select",
-            "node_s2w_tool": "node_s2w_tool",
-            "node_clarify": "node_clarify",
+            "node_plan_tables": "node_plan_tables",
         },
     )
     workflow.add_conditional_edges(
-        "node_intent_classifier",
-        fn_route_intent,
+        "node_plan_tables",
+        fn_route_plan,
         {
-            "node_configure_limits": "node_configure_limits",
-            "node_s2w_tool": "node_s2w_tool",
-            "node_use_loaded_data": "node_use_loaded_data",
-            "node_clarify": "node_clarify",
-            "node_respond": "node_respond",
-            "node_table_select": "node_table_select",
-        },
-    )
-    workflow.add_conditional_edges(
-        "node_s2w_tool",
-        fn_route_s2w,
-        {
-            "node_sql_generator": "node_sql_generator",
+            "node_prepare_sql": "node_prepare_sql",
             "node_error": "node_error",
         },
     )
-    workflow.add_edge("node_table_select", "node_table_sql")
-    workflow.add_edge("node_table_sql", "node_run_query")
-    workflow.add_edge("node_sql_generator", "node_sql_validator")
     workflow.add_conditional_edges(
-        "node_sql_validator",
-        fn_route_validation,
+        "node_prepare_sql",
+        fn_route_after_prepare,
         {
-            "node_sql_generator": "node_sql_generator",
             "node_run_query": "node_run_query",
             "node_error": "node_error",
         },
     )
     workflow.add_conditional_edges(
         "node_run_query",
-        fn_route_query,
+        fn_route_after_execute,
         {
-            "node_table_results": "node_table_results",
             "node_visualization": "node_visualization",
-            "node_load_data": "node_load_data",
-            "node_use_loaded_data": "node_use_loaded_data",
             "node_respond": "node_respond",
             "node_error": "node_error",
         },
@@ -924,23 +792,10 @@ def build_conversation_graph(provider: str | None = None):
         "node_visualization",
         fn_route_visualization_next,
         {
-            "node_table_results": "node_table_results",
-            "node_use_loaded_data": "node_use_loaded_data",
             "node_respond": "node_respond",
         },
     )
-    workflow.add_conditional_edges(
-        "node_table_results",
-        fn_route_table_progress,
-        {
-            "node_table_select": "node_table_select",
-            "node_respond": "node_respond",
-        },
-    )
-    workflow.add_edge("node_clarify", END)
     workflow.add_edge("node_respond", END)
-    workflow.add_edge("node_use_loaded_data", "node_visualization")
-    workflow.add_edge("node_load_data", END)
     workflow.add_edge("node_error", END)
     return workflow.compile()
 
