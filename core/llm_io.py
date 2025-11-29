@@ -59,6 +59,32 @@ def _strip_code_block(text: str) -> str:
     return (text or "").strip()
 
 
+def _prepare_messages(
+    system_prompt: str,
+    user_prompt: str,
+    history: List[ChatMessage] | None = None,
+) -> List[ChatMessage]:
+    """Build a chat message list that preserves recent history for context."""
+
+    messages: List[ChatMessage] = []
+    system_text = (system_prompt or "").strip()
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role not in {"system", "user", "assistant"} or not content:
+                continue
+            if role == "system" and system_text and content == system_text:
+                continue  # avoid duplicating the active system prompt
+            messages.append({"role": role, "content": content})
+    user_text = (user_prompt or "").strip()
+    if user_text:
+        messages.append({"role": "user", "content": user_text})
+    return messages
+
+
 def _openai_response(messages: List[ChatMessage], json_mode: bool = False) -> str:
     from openai import OpenAI
 
@@ -121,8 +147,8 @@ def _azure_response(messages: List[ChatMessage], json_mode: bool = False) -> str
             message = info.get("message")
             if message:
                 details = message
-        except Exception:
-            pass
+        except Exception as parse_exc:
+            details = f"{details} (error payload parse failed: {parse_exc})"
         return details
 
 
@@ -168,11 +194,13 @@ def _invoke_provider(messages: List[ChatMessage], provider: str, json_mode: bool
     return {"role": "assistant", "content": content.strip()}
 
 
-def _call_llm(provider: str, system_prompt: str, user_prompt: str) -> str:
-    messages: List[ChatMessage] = [
-        {"role": "system", "content": system_prompt.strip()},
-        {"role": "user", "content": user_prompt.strip()},
-    ]
+def _call_llm(
+    provider: str,
+    system_prompt: str,
+    user_prompt: str,
+    history: List[ChatMessage] | None = None,
+) -> str:
+    messages = _prepare_messages(system_prompt, user_prompt, history)
     reply = _invoke_provider(messages, provider)
     return reply["content"]
 
@@ -182,6 +210,7 @@ def _call_structured_llm(
     system_prompt: str,
     user_prompt: str,
     model_cls: Type[TModel],
+    history: List[ChatMessage] | None = None,
 ) -> TModel:
     """Request a JSON response matching the supplied Pydantic schema."""
 
@@ -195,10 +224,7 @@ def _call_structured_llm(
         + "\n\nRespond with a JSON object that matches this schema:\n"
         + json.dumps(schema, indent=2)
     )
-    messages: List[ChatMessage] = [
-        {"role": "system", "content": augmented_system},
-        {"role": "user", "content": user_prompt.strip()},
-    ]
+    messages = _prepare_messages(augmented_system, user_prompt, history)
     response = _invoke_provider(messages, provider, json_mode=True)
     raw_content = response["content"]
     cleaned = _strip_code_block(raw_content)

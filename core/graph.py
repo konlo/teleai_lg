@@ -305,7 +305,9 @@ def build_conversation_graph(provider: str | None = None):
         system_prompt = "You categorize user requests for a Databricks analytics assistant."
         user_prompt = f"User query:\n{query}"
         try:
-            parsed = _call_structured_llm(selected, system_prompt, user_prompt, Intent)
+            parsed = _call_structured_llm(
+                selected, system_prompt, user_prompt, Intent, history=state.get("state_messages")
+            )
             updates: AgentState = {
                 "state_intent": parsed.intent,
                 "state_user_query": query,
@@ -422,11 +424,17 @@ def build_conversation_graph(provider: str | None = None):
                     user_prompt += f"\n(Attempt #{attempt + 1} — pay extra attention to syntax.)"
                 try:
                     structured = _call_structured_llm(
-                        selected, tool_prompt, user_prompt, GeneratedSQL
+                        selected,
+                        tool_prompt,
+                        user_prompt,
+                        GeneratedSQL,
+                        history=state.get("state_messages"),
                     )
                     raw_sql = structured.sql.strip()
                 except Exception:
-                    raw_sql = _call_llm(selected, tool_prompt, user_prompt).strip()
+                    raw_sql = _call_llm(
+                        selected, tool_prompt, user_prompt, history=state.get("state_messages")
+                    ).strip()
                 sql = _strip_code_block(raw_sql)
 
             validation_error = validate_sql_statement(
@@ -510,13 +518,19 @@ def build_conversation_graph(provider: str | None = None):
         )
         try:
             structured = _call_structured_llm(
-                selected, system_prompt, user_prompt, VisualizationCodeResponse
+                selected,
+                system_prompt,
+                user_prompt,
+                VisualizationCodeResponse,
+                history=state.get("state_messages"),
             )
             if structured.language.lower() != "python":
                 raise ValueError("Visualization code must be in Python.")
             code = structured.code.strip()
         except Exception:
-            code = _call_llm(selected, system_prompt, user_prompt).strip()
+            code = _call_llm(
+                selected, system_prompt, user_prompt, history=state.get("state_messages")
+            ).strip()
         clean_code = _strip_code_block(code)
         wrapped = f"```python\n{clean_code}\n```"
         updates: AgentState = {"state_visualization_code": wrapped}
@@ -572,11 +586,17 @@ def build_conversation_graph(provider: str | None = None):
             )
             try:
                 structured = _call_structured_llm(
-                    selected, system_prompt, user_prompt, ClarificationRequest
+                    selected,
+                    system_prompt,
+                    user_prompt,
+                    ClarificationRequest,
+                    history=state.get("state_messages"),
                 )
                 reply = structured.follow_up_question.strip()
             except Exception:
-                reply = _call_llm(selected, system_prompt, user_prompt).strip()
+                reply = _call_llm(
+                    selected, system_prompt, user_prompt, history=state.get("state_messages")
+                ).strip()
             final_text = reply
         elif state.get("state_limit_only"):
             limit = state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
@@ -607,7 +627,11 @@ def build_conversation_graph(provider: str | None = None):
             )
             try:
                 structured = _call_structured_llm(
-                    selected, system_prompt, user_prompt, StructuredAnswer
+                    selected,
+                    system_prompt,
+                    user_prompt,
+                    StructuredAnswer,
+                    history=state.get("state_messages"),
                 )
                 reply = structured.answer.strip()
                 if structured.highlights:
@@ -617,7 +641,9 @@ def build_conversation_graph(provider: str | None = None):
                     if highlight_lines:
                         reply = f"{reply}\n\n하이라이트:\n{highlight_lines}"
             except Exception:
-                reply = _call_llm(selected, system_prompt, user_prompt).strip()
+                reply = _call_llm(
+                    selected, system_prompt, user_prompt, history=state.get("state_messages")
+                ).strip()
             final_text = reply
             if visualization_blocks:
                 blocks = "\n\n".join(visualization_blocks)
@@ -649,7 +675,11 @@ def build_conversation_graph(provider: str | None = None):
             )
             try:
                 structured = _call_structured_llm(
-                    selected, system_prompt, user_prompt, StructuredAnswer
+                    selected,
+                    system_prompt,
+                    user_prompt,
+                    StructuredAnswer,
+                    history=state.get("state_messages"),
                 )
                 reply = structured.answer.strip()
                 if structured.highlights:
@@ -659,7 +689,9 @@ def build_conversation_graph(provider: str | None = None):
                     if highlight_lines:
                         reply = f"{reply}\n\n하이라이트:\n{highlight_lines}"
             except Exception:
-                reply = _call_llm(selected, system_prompt, user_prompt).strip()
+                reply = _call_llm(
+                    selected, system_prompt, user_prompt, history=state.get("state_messages")
+                ).strip()
             final_text = reply
 
         if intent == "visualize":
