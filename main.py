@@ -14,19 +14,6 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     def load_dotenv():
         return None
 
-try:
-    # Newer langchain
-    from langchain.callbacks import StreamlitCallbackHandler
-    _streamlit_cb_error = None
-except Exception as exc1:  # pragma: no cover - optional dependency
-    try:
-        # Older path
-        from langchain.callbacks.streamlit import StreamlitCallbackHandler
-        _streamlit_cb_error = None
-    except Exception as exc2:  # pragma: no cover - optional dependency
-        StreamlitCallbackHandler = None
-        _streamlit_cb_error = f"{exc1} / {exc2}"
-
 from core.databricks import fetch_table_metadata, fetch_table_preview, list_tables
 from core.llm import ChatMessage, DEFAULT_SQL_LIMIT
 from core.graph import build_conversation_graph
@@ -263,16 +250,6 @@ def main() -> None:
                 st.markdown(f"- **{node_key}**: {description}")
             st.graphviz_chart(LANGGRAPH_DOT)
 
-        trace_container = st.expander("LLM Trace (Streamlit callback)", expanded=False)
-        if StreamlitCallbackHandler is None:
-            trace_container.info(
-                "StreamlitCallbackHandler를 불러오지 못했습니다. "
-                "langchain 버전을 확인하거나 `pip install langchain` 후 다시 실행해 주세요."
-                f"{f' (import node_error: {_streamlit_cb_error})' if _streamlit_cb_error else ''}"
-            )
-        else:
-            trace_container.caption("여기에서 LLM 호출 로그를 확인할 수 있어요.")
-
     for index, (role, content) in enumerate(st.session_state.history):
         with st.chat_message(role):
             st.markdown(content)
@@ -329,9 +306,6 @@ def main() -> None:
             try:
                 graph = st.session_state.graph
                 metadata = st.session_state.get("state_table_metadata", {})
-                callbacks = []
-                if StreamlitCallbackHandler is not None:
-                    callbacks.append(StreamlitCallbackHandler(trace_container))
                 response_state = graph.invoke(
                     {
                         "state_messages": _lc_messages(st.session_state.history),
@@ -342,7 +316,6 @@ def main() -> None:
                         "state_loaded_table": st.session_state.get("state_loaded_table"),
                         "state_active_table_metadata": st.session_state.get("state_active_table_metadata"),
                     },
-                    config={"callbacks": callbacks} if callbacks else None,
                 )
                 latest = response_state["state_messages"][-1]
                 response_text = latest["content"]
