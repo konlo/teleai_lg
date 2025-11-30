@@ -506,7 +506,8 @@ def build_conversation_graph(provider: str | None = None):
             "You create Matplotlib visualization code for tabular data. "
             "A pandas DataFrame named `df` is already constructed from the provided rows; use it directly. "
             "Imports for pandas as pd and matplotlib.pyplot as plt are already available. "
-            "Close with plt.tight_layout(). Return only a Python code block."
+            "Close with plt.tight_layout(). Return only a Python code block. "
+            "Do not use Altair, Plotly, Seaborn, or other libraries."
         )
         table_name = state.get("state_current_table")
         table_context = f"Current table: {table_name}\n" if table_name else ""
@@ -514,7 +515,7 @@ def build_conversation_graph(provider: str | None = None):
             f"{table_context}User request:\n{user_query}\n\n"
             f"Sample rows JSON (for schema only):\n{data_json}\n\n"
             "Generate concise visualization code that assumes a DataFrame `df` is already available. "
-            "Populate `language` and `code` fields."
+            "Populate `language` and `code` fields, ensuring the code uses Matplotlib only."
         )
         try:
             structured = _call_structured_llm(

@@ -224,11 +224,26 @@ def _call_structured_llm(
         + "\n\nRespond with a JSON object that matches this schema:\n"
         + json.dumps(schema, indent=2)
     )
-    messages = _prepare_messages(augmented_system, user_prompt, history)
-    response = _invoke_provider(messages, provider, json_mode=True)
-    raw_content = response["content"]
-    cleaned = _strip_code_block(raw_content)
-    return validator(cleaned)
+    attempts = [history] if history else [None]
+    if history:
+        attempts.append(None)  # Fallback: retry without history if validation fails.
+
+    last_error: Exception | None = None
+    for attempt_history in attempts:
+        messages = _prepare_messages(augmented_system, user_prompt, attempt_history)
+        response = _invoke_provider(messages, provider, json_mode=True)
+        raw_content = response["content"]
+        cleaned = _strip_code_block(raw_content)
+        try:
+            return validator(cleaned)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    # If we reach here, validation failed for all attempts.
+    if last_error:
+        raise last_error
+    raise RuntimeError("Structured LLM call failed without an error detail.")
 
 
 class Intent(BaseModel):

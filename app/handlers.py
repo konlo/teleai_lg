@@ -9,6 +9,11 @@ from typing import Any, Dict, List, Tuple
 
 import streamlit as st
 
+try:
+    import altair as alt
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    alt = None
+
 CODE_BLOCK_PATTERN = re.compile(r"```(?P<lang>\w+)?\s*([\s\S]+?)```", re.IGNORECASE)
 # Replace JSON-style literals with Python equivalents when the LLM emits
 # node_visualization code snippets. This avoids NameError when the model returns
@@ -106,6 +111,37 @@ def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = N
     return images
 
 
+def _execute_altair_code(code: str, rows: List[Dict[str, Any]] | None = None):
+    """Render Altair chart blocks inline via Streamlit."""
+
+    if alt is None:
+        raise RuntimeError("Altair is not installed. Please add `altair` to dependencies.")
+    import pandas as pd
+
+    df = pd.DataFrame(rows or [])
+    namespace: Dict[str, Any] = {"alt": alt, "df": df}
+    try:
+        compiled = compile(code, "<altair_block>", "eval")
+        result = eval(compiled, namespace)
+    except SyntaxError:
+        try:
+            exec(code, namespace)
+            result = None
+        except Exception as exc:
+            raise RuntimeError(f"Altair code execution failed: {exc}") from exc
+    if result is None:
+        for value in namespace.values():
+            # Altair Chart/LayerChart/etc. share to_dict and module prefix
+            if hasattr(value, "to_dict") and getattr(value.__class__, "__module__", "").startswith(
+                "altair"
+            ):
+                result = value
+                break
+    if result is None:
+        raise RuntimeError("Altair chart object not found after execution.")
+    st.altair_chart(result, use_container_width=True)
+
+
 def _render_visualizations(message_index: int) -> None:
     """Show stored node_visualization outputs for a conversation turn."""
     visualizations = st.session_state.get("visualizations", {})
@@ -144,8 +180,7 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
     if not rows_for_msg:
         rows_for_msg = st.session_state.get("state_loaded_data") or []
     for idx, (lang, code) in enumerate(code_blocks, start=1):
-        lang_lower = lang or ""
-        lang_lower = lang_lower.lower()
+        lang_lower = (lang or "").lower()
         if lang_lower in {"dot", "graphviz"} or _is_graphviz_code(code):
             st.graphviz_chart(code)
             graphs = st.session_state.setdefault("visualization_graphs", {})
@@ -157,10 +192,18 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
         if lang_lower == "json" or _looks_like_json(code):
             st.code(code, language="json")
             continue
-        if lang_lower and lang_lower != "python":
-            continue
-        if not lang_lower:
-            st.code(code)
+        if lang_lower in {"altair", "vega", "vega-lite", "vegalite"} or "alt.Chart" in code:
+            try:
+                _execute_altair_code(code, rows_for_msg)
+                _append_visualization_message(
+                    message_index, "info", f"Code block {idx} Altair 렌더링 완료."
+                )
+            except Exception as exc:
+                _append_visualization_message(
+                    message_index,
+                    "node_error",
+                    f"⚠️ Altair code block {idx} 실행 중 오류: {exc}",
+                )
             continue
         if lang_lower and lang_lower != "python":
             _append_visualization_message(
@@ -169,6 +212,7 @@ def _handle_visualization_blocks(text: str, message_index: int) -> None:
                 f"Code block {idx}은 지원되지 않는 언어({lang})라 실행하지 않았어요.",
             )
             continue
+        # Treat missing language as Python to increase visualization success.
         codes = st.session_state.setdefault("visualization_codes", {})
         codes.setdefault(message_index, []).append(code)
         try:
