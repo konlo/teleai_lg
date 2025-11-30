@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 import re
 import json
-from typing import Any, Dict, Iterable, List, Tuple
+import asyncio
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import streamlit as st
 
@@ -66,6 +67,75 @@ digraph {
     node_error -> end;
 }
 """
+
+
+def parse_debug_command(user_input: str) -> Optional[bool]:
+    """Return True/False if %debug on/off is requested, else None."""
+
+    if not user_input:
+        return None
+    normalized = user_input.strip().lower()
+    if normalized == "%debug on":
+        return True
+    if normalized == "%debug off":
+        return False
+    return None
+
+
+def render_debug_sidebar():
+    """Render sidebar debug container when debug_mode is enabled."""
+
+    if not st.session_state.get("debug_mode"):
+        return None
+    with st.sidebar:
+        st.markdown("### 🔍 Debug Events")
+        return st.container()
+
+
+def run_async(coro):
+    """Run coroutine regardless of existing event loop state."""
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        return asyncio.ensure_future(coro)
+    return asyncio.run(coro)
+
+
+async def run_graph_with_events(app, query, debug_box):
+    """Execute graph with event streaming and surface events to sidebar."""
+
+    final_state = None
+    async for event in app.astream_events(query, version="v1"):
+        event_type = event.get("type") or event.get("event")
+        data = event.get("data") or {}
+        if debug_box:
+            if event_type == "node.started":
+                debug_box.write(f"🟡 Node Started: {data.get('name') or data.get('node')}")
+            elif event_type == "node.completed":
+                debug_box.write(f"🟢 Node Completed: {data.get('name') or data.get('node')}")
+            elif event_type == "llm.streaming.chunk":
+                token = data.get("chunk") or data.get("token") or data.get("text") or data
+                debug_box.write(f"✏️ Token: {token}")
+            elif event_type == "tool.started":
+                debug_box.write(f"🔧 Tool Started: {data.get('name') or data.get('tool')}")
+            elif event_type == "tool.completed":
+                debug_box.write(f"🔨 Tool Completed: {data.get('name') or data.get('tool')}")
+            elif event_type == "state.diff":
+                debug_box.write("🧩 State Diff:")
+                try:
+                    debug_box.json(data)
+                except Exception:
+                    debug_box.write(data)
+        if event_type in {"node.completed", "graph.completed", "graph.end"}:
+            if isinstance(data, dict):
+                final_state = data.get("output") or data.get("state") or final_state
+    if final_state is None:
+        final_state = await app.ainvoke(query)
+    return final_state
+
 
 def _find_table_references(prompt: str, candidates: Iterable[str]) -> List[str]:
     """Return all candidate tables mentioned in the prompt (case-insensitive)."""
@@ -158,6 +228,8 @@ def main() -> None:
         st.session_state.node_paths = {}
     if "state_sql_limit" not in st.session_state:
         st.session_state.state_sql_limit = DEFAULT_SQL_LIMIT
+    if "debug_mode" not in st.session_state:
+        st.session_state.debug_mode = False
 
     with st.sidebar:
         provider = os.environ.get("LLM_PROVIDER", "google").lower()
@@ -250,6 +322,8 @@ def main() -> None:
                 st.markdown(f"- **{node_key}**: {description}")
             st.graphviz_chart(LANGGRAPH_DOT)
 
+    debug_box = render_debug_sidebar()
+
     for index, (role, content) in enumerate(st.session_state.history):
         with st.chat_message(role):
             st.markdown(content)
@@ -257,6 +331,17 @@ def main() -> None:
             _render_node_flow(index)
 
     if prompt := st.chat_input("Enter your message"):
+        command_state = parse_debug_command(prompt)
+        if command_state is not None:
+            st.session_state.debug_mode = command_state
+            status_text = "Debug mode enabled." if command_state else "Debug mode disabled."
+            with st.chat_message("assistant"):
+                st.markdown(status_text)
+            st.session_state.history.append(("assistant", status_text))
+            rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+            if rerun:
+                rerun()
+
         st.session_state.history.append(("user", prompt))
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -306,17 +391,21 @@ def main() -> None:
             try:
                 graph = st.session_state.graph
                 metadata = st.session_state.get("state_table_metadata", {})
-                response_state = graph.invoke(
-                    {
-                        "state_messages": _lc_messages(st.session_state.history),
-                        "state_table_metadata": metadata,
-                        "state_sql_limit": st.session_state.get("state_sql_limit", DEFAULT_SQL_LIMIT),
-                        "state_loaded_data": st.session_state.get("state_loaded_data"),
-                        "state_loaded_columns": st.session_state.get("state_loaded_columns"),
-                        "state_loaded_table": st.session_state.get("state_loaded_table"),
-                        "state_active_table_metadata": st.session_state.get("state_active_table_metadata"),
-                    },
-                )
+                graph_input = {
+                    "state_messages": _lc_messages(st.session_state.history),
+                    "state_table_metadata": metadata,
+                    "state_sql_limit": st.session_state.get("state_sql_limit", DEFAULT_SQL_LIMIT),
+                    "state_loaded_data": st.session_state.get("state_loaded_data"),
+                    "state_loaded_columns": st.session_state.get("state_loaded_columns"),
+                    "state_loaded_table": st.session_state.get("state_loaded_table"),
+                    "state_active_table_metadata": st.session_state.get("state_active_table_metadata"),
+                }
+                if st.session_state.get("debug_mode"):
+                    response_state = run_async(run_graph_with_events(graph, graph_input, debug_box))
+                    if asyncio.isfuture(response_state):
+                        response_state = response_state.result()
+                else:
+                    response_state = graph.invoke(graph_input)
                 latest = response_state["state_messages"][-1]
                 response_text = latest["content"]
                 node_path = response_state.get("state_node_path", [])
