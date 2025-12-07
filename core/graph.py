@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Literal, Tuple, TypedDict
+from typing import Any, Dict, List, Literal, Tuple, TypedDict, Union
 
 from langgraph.graph import END, StateGraph
+from langgraph.types import Interrupt
 
 from core.databricks import run_sql_query
 from core.llm_io import (
@@ -19,6 +20,7 @@ from core.llm_io import (
     VisualizationCodeResponse,
     SUMMARY_SYSTEM_PROMPT,
     _call_llm,
+    choose_route_with_llm,
     _call_structured_llm,
     _safe_json_dumps,
     _strip_code_block,
@@ -50,6 +52,8 @@ class AgentState(TypedDict, total=False):
     state_messages: List[ChatMessage]
     state_limit_requested: bool
     state_limit_only: bool
+    state_sql_approved: bool
+    state_viz_approved: bool
     state_loading_requested: bool
     state_loaded_data: Any
     state_loaded_table: str
@@ -159,9 +163,12 @@ def _format_schema_context(table_metadata: Dict[str, Any] | None) -> str:
 
 
 def _select_relevant_metadata(
-    user_query: str, table_metadata: Dict[str, Any] | None
+    user_query: str,
+    table_metadata: Dict[str, Any] | None,
+    max_tables: int = MAX_MULTI_TABLES,
+    keywords: Tuple[str, ...] = MULTI_TABLE_KEYWORDS,
 ) -> Dict[str, Any]:
-    return select_relevant_metadata(user_query, table_metadata, MAX_MULTI_TABLES, MULTI_TABLE_KEYWORDS)
+    return select_relevant_metadata(user_query, table_metadata, max_tables, keywords)
 
 
 def _s2w_tool_description(
@@ -264,6 +271,53 @@ def build_conversation_graph(provider: str | None = None):
         payload["state_node_traces"] = traces
         _log_node_io(node_name, input_snapshot, output_snapshot, merged_state)
         return payload
+
+    def _routing_state_summary(state: AgentState) -> Dict[str, Any]:
+        """Compact state snapshot passed to the LLM router."""
+
+        return {
+            "intent": state.get("state_intent"),
+            "limit_only": state.get("state_limit_only"),
+            "require_mode_confirmation": state.get("state_require_mode_confirmation"),
+            "loading_requested": state.get("state_loading_requested"),
+            "error_present": bool(state.get("state_error_message")),
+            "table_queue_size": len(state.get("state_table_queue") or []),
+            "current_table": state.get("state_current_table"),
+            "has_sql": bool(state.get("state_sql_query")),
+            "has_data": bool(state.get("state_loaded_data")),
+            "visualization_mode": state.get("state_visualization_mode"),
+            "size_guardrail": state.get("state_size_guardrail_triggered"),
+        }
+
+    def _route_with_llm(
+        state: AgentState, options: List[str], fallback: str, hint: str = ""
+    ) -> str:
+        """Delegate routing to the LLM with a safe fallback and self-heal pass."""
+
+        summary = _routing_state_summary(state)
+
+        def _ask_route(extra_hint: str, history=None) -> str | None:
+            try:
+                decision = choose_route_with_llm(
+                    selected,
+                    options,
+                    summary,
+                    history=history,
+                    hint=f"{hint}{extra_hint}",
+                )
+                next_node = getattr(decision, "next_node", None)
+                if next_node in options:
+                    return next_node
+            except Exception as exc:
+                print(f"[router] LLM routing failed: {exc}")
+            return None
+
+        # First attempt with conversation history
+        next_node = _ask_route("", history=state.get("state_messages"))
+        if not next_node:
+            # Second attempt without history and an explicit constraint hint
+            next_node = _ask_route("\nOnly choose from the listed node labels.", history=None)
+        return next_node or fallback
 
     # ----------------------
     # Compact node functions
@@ -403,6 +457,17 @@ def build_conversation_graph(provider: str | None = None):
             state.get("state_visualization_mode"),
         )
         sql: str = state.get("state_sql_query", "")
+        if sql and state.get("state_sql_approved"):
+            return with_path(
+                state,
+                "node_prepare_sql",
+                {
+                    "state_sql_query": sql,
+                    "state_error_message": "",
+                    "state_sql_validation_error": "",
+                    "state_sql_approved": True,
+                },
+            )
         error_message = ""
 
         for attempt in range(SQL_VALIDATION_MAX_RETRIES + 1):
@@ -455,9 +520,20 @@ def build_conversation_graph(provider: str | None = None):
             "state_sql_query": sql,
             "state_error_message": error_message,
             "state_sql_validation_error": "",
+            "state_sql_approved": state.get("state_sql_approved", False),
         }
         if error_message:
             updates["state_sql_validation_error"] = error_message
+        if sql and not error_message and not state.get("state_sql_approved"):
+            # Human-in-the-loop: ask for SQL approval before execution.
+            raise Interrupt(
+                "approve_sql",
+                data={
+                    "sql": sql,
+                    "table": state.get("state_current_table"),
+                    "intent": state.get("state_intent"),
+                },
+            )
         return with_path(state, "node_prepare_sql", updates)
 
     def fn_execute_sql(state: AgentState) -> AgentState:
@@ -502,14 +578,42 @@ def build_conversation_graph(provider: str | None = None):
         sample = rows[:10]
         data_json = _safe_json_dumps(sample)
         user_query = state.get("state_user_query", "")
+        approved_code = state.get("state_visualization_code")
+        table_name = state.get("state_current_table")
+        if state.get("state_viz_approved") and approved_code:
+            wrapped_code = approved_code
+            outputs = list(state.get("state_table_outputs") or [])
+            viz_blocks = list(state.get("state_visualization_blocks") or [])
+            if table_name:
+                outputs.append(
+                    {
+                        "table": table_name,
+                        "sql": state.get("state_sql_query", ""),
+                        "row_count": len(rows),
+                        "rows": rows[:20],
+                    }
+                )
+                viz_blocks.append(f"**{table_name}** 테이블 시각화\n\n{wrapped_code}")
+            else:
+                viz_blocks.append(wrapped_code)
+            updates: AgentState = {
+                "state_visualization_code": wrapped_code,
+                "state_table_outputs": outputs,
+                "state_visualization_blocks": viz_blocks,
+                "state_table_queue": state.get("state_table_queue") or [],
+                "state_current_table": "",
+                "state_viz_approved": True,
+            }
+            return with_path(state, "node_visualization", updates)
+
         system_prompt = (
             "You create Matplotlib visualization code for tabular data. "
             "A pandas DataFrame named `df` is already constructed from the provided rows; use it directly. "
             "Imports for pandas as pd and matplotlib.pyplot as plt are already available. "
             "Close with plt.tight_layout(). Return only a Python code block. "
-            "Do not use Altair, Plotly, Seaborn, or other libraries."
+            "Do not use Altair, Plotly, Seaborn, or other libraries. "
+            "Do not call plt.show() or fig.show() (non-interactive backend)."
         )
-        table_name = state.get("state_current_table")
         table_context = f"Current table: {table_name}\n" if table_name else ""
         user_prompt = (
             f"{table_context}User request:\n{user_query}\n\n"
@@ -534,28 +638,15 @@ def build_conversation_graph(provider: str | None = None):
             ).strip()
         clean_code = _strip_code_block(code)
         wrapped = f"```python\n{clean_code}\n```"
-        updates: AgentState = {"state_visualization_code": wrapped}
-        table_name = state.get("state_current_table", "")
-        outputs = list(state.get("state_table_outputs") or [])
-        viz_blocks = list(state.get("state_visualization_blocks") or [])
-        if table_name:
-            outputs.append(
-                {
-                    "table": table_name,
-                    "sql": state.get("state_sql_query", ""),
-                    "row_count": len(rows),
-                    "rows": rows[:20],
-                }
-            )
-            viz_blocks.append(f"**{table_name}** 테이블 시각화\n\n{wrapped}")
-            updates["state_current_table"] = ""
-        else:
-            viz_blocks.append(wrapped)
-        updates["state_table_outputs"] = outputs
-        updates["state_visualization_blocks"] = viz_blocks
-        updates["state_visualization_code"] = wrapped
-        updates["state_table_queue"] = state.get("state_table_queue") or []
-        return with_path(state, "node_visualization", updates)
+        # Human-in-the-loop: request approval before surfacing visualization code.
+        raise Interrupt(
+            "approve_viz",
+            data={
+                "code": clean_code,
+                "table": table_name,
+                "sql": state.get("state_sql_query"),
+            },
+        )
 
     def fn_respond(state: AgentState) -> AgentState:
         intent = state.get("state_intent", "simple_answer")
@@ -747,37 +838,54 @@ def build_conversation_graph(provider: str | None = None):
         )
 
     def fn_route_ingest(state: AgentState) -> str:
+        fallback = "node_plan_tables"
         if state.get("state_limit_only"):
-            return "node_respond"
-        if state.get("state_require_mode_confirmation") or state.get("state_intent") == "clarify":
-            return "node_respond"
-        if state.get("state_intent") in {"visualize", "sql_query"} or state.get("state_loading_requested"):
-            return "node_plan_tables"
-        return "node_respond"
+            fallback = "node_respond"
+        elif state.get("state_require_mode_confirmation") or state.get("state_intent") == "clarify":
+            fallback = "node_respond"
+        elif state.get("state_intent") not in {"visualize", "sql_query"} and not state.get("state_loading_requested"):
+            fallback = "node_respond"
+        options = ["node_respond", "node_plan_tables"]
+        hint = (
+            "Choose node_plan_tables for visualization/SQL/loading requests. "
+            "If the user only changed %limit or needs clarification/simple response, choose node_respond."
+        )
+        return _route_with_llm(state, options, fallback, hint)
 
     def fn_route_plan(state: AgentState) -> str:
-        if state.get("state_error_message"):
-            return "node_error"
-        return "node_prepare_sql"
+        options = ["node_prepare_sql", "node_error"]
+        fallback = "node_error" if state.get("state_error_message") else "node_prepare_sql"
+        hint = "If any error_message exists pick node_error; otherwise continue to node_prepare_sql."
+        return _route_with_llm(state, options, fallback, hint)
 
     def fn_route_after_prepare(state: AgentState) -> str:
-        if state.get("state_error_message"):
-            return "node_error"
-        return "node_run_query"
+        options = ["node_run_query", "node_error"]
+        fallback = "node_error" if state.get("state_error_message") else "node_run_query"
+        hint = "If SQL validation failed or error_message is set, use node_error; otherwise run the query."
+        return _route_with_llm(state, options, fallback, hint)
 
     def fn_route_after_execute(state: AgentState) -> str:
+        options = ["node_visualization", "node_plan_tables", "node_respond", "node_error"]
         if state.get("state_error_message"):
-            return "node_error"
-        if state.get("state_intent") == "visualize":
-            return "node_visualization"
-        if state.get("state_table_queue"):
-            return "node_plan_tables"
-        return "node_respond"
+            fallback = "node_error"
+        elif state.get("state_intent") == "visualize":
+            fallback = "node_visualization"
+        elif state.get("state_table_queue"):
+            fallback = "node_plan_tables"
+        else:
+            fallback = "node_respond"
+        hint = (
+            "Prefer node_error when execution failed. "
+            "If the request is for visualization, go to node_visualization. "
+            "If more tables remain, choose node_plan_tables; otherwise reply via node_respond."
+        )
+        return _route_with_llm(state, options, fallback, hint)
 
     def fn_route_visualization_next(state: AgentState) -> str:
-        if state.get("state_table_queue"):
-            return "node_plan_tables"
-        return "node_respond"
+        options = ["node_plan_tables", "node_respond"]
+        fallback = "node_plan_tables" if state.get("state_table_queue") else "node_respond"
+        hint = "If additional tables remain in the queue continue with node_plan_tables; otherwise finish at node_respond."
+        return _route_with_llm(state, options, fallback, hint)
 
     workflow.add_node("node_ingest", fn_ingest)
     workflow.add_node("node_plan_tables", fn_plan_tables)

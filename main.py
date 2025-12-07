@@ -129,6 +129,11 @@ async def run_graph_with_events(app, query, debug_box):
                     debug_box.json(data)
                 except Exception:
                     debug_box.write(data)
+            elif event_type == "interrupt":
+                debug_box.write(f"⏸️ Interrupt: {data}")
+        if event_type == "interrupt":
+            final_state = {"interrupt": data}
+            break
         if event_type in {"node.completed", "graph.completed", "graph.end"}:
             if isinstance(data, dict):
                 final_state = data.get("output") or data.get("state") or final_state
@@ -204,6 +209,73 @@ def _lc_messages(history: List[Tuple[str, str]]) -> List[ChatMessage]:
     return messages
 
 
+def _build_graph_input(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Assemble the baseline graph input with optional overrides."""
+
+    payload = {
+        "state_messages": _lc_messages(st.session_state.history),
+        "state_table_metadata": st.session_state.get("state_table_metadata", {}),
+        "state_sql_limit": st.session_state.get("state_sql_limit", DEFAULT_SQL_LIMIT),
+        "state_loaded_data": st.session_state.get("state_loaded_data"),
+        "state_loaded_columns": st.session_state.get("state_loaded_columns"),
+        "state_loaded_table": st.session_state.get("state_loaded_table"),
+        "state_active_table_metadata": st.session_state.get("state_active_table_metadata"),
+        "state_sql_query": st.session_state.get("state_sql_query", ""),
+        "state_visualization_code": st.session_state.get("state_visualization_code", ""),
+        "state_sql_approved": st.session_state.get("state_sql_approved", False),
+        "state_viz_approved": st.session_state.get("state_viz_approved", False),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _handle_response_state(
+    response_state: Dict[str, Any] | None, assistant_segments: List[str]
+) -> None:
+    """Render response/interrupt results, update history, and cache viz data."""
+
+    if isinstance(response_state, dict) and "interrupt" in response_state:
+        interrupt = response_state["interrupt"] or {}
+        st.session_state.pending_interrupt = interrupt
+        name = interrupt.get("name") or interrupt.get("type") or "승인 요청"
+        response_text = f"⏸️ {name} 승인이 필요합니다. 아래 승인 폼을 완료해 주세요."
+        node_path: List[str] = []
+    elif response_state:
+        latest = response_state["state_messages"][-1]
+        response_text = latest["content"]
+        node_path = response_state.get("state_node_path", [])
+        st.session_state.state_sql_limit = response_state.get("state_sql_limit", DEFAULT_SQL_LIMIT)
+    else:
+        response_text = "⚠️ 알 수 없는 오류가 발생했습니다."
+        node_path = []
+
+    assistant_segments.append(response_text)
+    combined_text = "\n\n".join(segment for segment in assistant_segments if segment)
+    st.session_state.history.append(("assistant", combined_text))
+    message_index = len(st.session_state.history) - 1
+    viz_rows = st.session_state.setdefault("viz_rows", {})
+    viz_rows[message_index] = response_state.get("state_loaded_data") if response_state else []
+    viz_tables = st.session_state.setdefault("viz_table_outputs", {})
+    viz_tables[message_index] = response_state.get("state_table_outputs") if response_state else []
+    if response_state and "interrupt" not in response_state:
+        st.session_state.state_loaded_data = response_state.get("state_loaded_data")
+        st.session_state.state_loaded_columns = response_state.get("state_loaded_columns")
+        st.session_state.state_loaded_table = response_state.get("state_loaded_table")
+        st.session_state.state_active_table_metadata = response_state.get("state_active_table_metadata")
+        st.session_state.state_sql_query = response_state.get("state_sql_query", "")
+        st.session_state.state_visualization_code = response_state.get("state_visualization_code", "")
+        st.session_state.state_sql_approved = response_state.get("state_sql_approved", False)
+        st.session_state.state_viz_approved = response_state.get("state_viz_approved", False)
+    if node_path and node_path[-1] == "node_error":
+        st.error(response_text)
+    else:
+        st.markdown(response_text)
+    _handle_visualization_blocks(response_text, message_index)
+    _store_node_path(message_index, node_path)
+    _render_node_flow(message_index)
+
+
 def main() -> None:
     st.set_page_config(page_title="LangGraph Chatbot", page_icon="💬")
     st.title("LangGraph Chatbot")
@@ -224,6 +296,16 @@ def main() -> None:
         st.session_state.state_loaded_columns = []
     if "state_loaded_table" not in st.session_state:
         st.session_state.state_loaded_table = ""
+    if "state_sql_query" not in st.session_state:
+        st.session_state.state_sql_query = ""
+    if "state_visualization_code" not in st.session_state:
+        st.session_state.state_visualization_code = ""
+    if "state_sql_approved" not in st.session_state:
+        st.session_state.state_sql_approved = False
+    if "state_viz_approved" not in st.session_state:
+        st.session_state.state_viz_approved = False
+    if "pending_interrupt" not in st.session_state:
+        st.session_state.pending_interrupt = None
     if "node_paths" not in st.session_state:
         st.session_state.node_paths = {}
     if "state_sql_limit" not in st.session_state:
@@ -330,6 +412,110 @@ def main() -> None:
             _render_visualizations(index)
             _render_node_flow(index)
 
+    pending_interrupt = st.session_state.get("pending_interrupt")
+    if pending_interrupt:
+        interrupt_name = (
+            pending_interrupt.get("name")
+            or pending_interrupt.get("type")
+            or pending_interrupt.get("event")
+            or "승인 요청"
+        )
+        interrupt_payload = pending_interrupt.get("data") or {}
+        with st.expander(f"⏸️ {interrupt_name} 승인 필요", expanded=True):
+            st.caption("그래프가 사용자 승인 대기 중입니다. 승인/수정/거절을 선택하세요.")
+            if interrupt_name == "approve_sql":
+                sql_text = interrupt_payload.get("sql", "")
+                st.code(sql_text or "SQL 없음", language="sql")
+                with st.form("approve_sql_form"):
+                    decision = st.radio(
+                        "SQL 실행 여부",
+                        ("승인", "수정 후 승인", "거절"),
+                        index=0,
+                        horizontal=True,
+                    )
+                    edited_sql = st.text_area("SQL 수정", value=sql_text, height=200)
+                    submitted = st.form_submit_button("응답 전송")
+                    if submitted:
+                        if decision == "거절":
+                            st.session_state.pending_interrupt = None
+                            st.session_state.state_sql_approved = False
+                            _handle_response_state(
+                                {
+                                    "state_messages": [
+                                        {
+                                            "role": "assistant",
+                                            "content": "사용자가 SQL 실행을 거절했습니다. 요청을 다시 입력해 주세요.",
+                                        }
+                                    ]
+                                },
+                                [],
+                            )
+                        else:
+                            approved_sql = sql_text if decision == "승인" else edited_sql.strip()
+                            if not approved_sql:
+                                st.warning("승인할 SQL이 없습니다.")
+                            else:
+                                st.session_state.pending_interrupt = None
+                                st.session_state.state_sql_query = approved_sql
+                                st.session_state.state_sql_approved = True
+                                graph = st.session_state.graph
+                                updates = {
+                                    "state_sql_query": approved_sql,
+                                    "state_sql_approved": True,
+                                    "state_error_message": "",
+                                    "state_sql_validation_error": "",
+                                }
+                                graph_input = _build_graph_input(updates)
+                                resume_state = run_async(
+                                    run_graph_with_events(graph, graph_input, debug_box)
+                                )
+                                if asyncio.isfuture(resume_state):
+                                    resume_state = resume_state.result()
+                                _handle_response_state(resume_state, [])
+            elif interrupt_name == "approve_viz":
+                code_text = interrupt_payload.get("code", "")
+                st.code(code_text or "코드 없음", language="python")
+                with st.form("approve_viz_form"):
+                    decision = st.radio(
+                        "시각화 코드 실행 여부",
+                        ("승인", "거절"),
+                        index=0,
+                        horizontal=True,
+                    )
+                    submitted = st.form_submit_button("응답 전송")
+                    if submitted:
+                        if decision == "거절":
+                            st.session_state.pending_interrupt = None
+                            st.session_state.state_viz_approved = False
+                            _handle_response_state(
+                                {
+                                    "state_messages": [
+                                        {
+                                            "role": "assistant",
+                                            "content": "사용자가 시각화 실행을 거절했습니다. 다른 요청을 입력해 주세요.",
+                                        }
+                                    ]
+                                },
+                                [],
+                            )
+                        else:
+                            st.session_state.pending_interrupt = None
+                            wrapped = f"```python\n{code_text}\n```" if code_text else ""
+                            st.session_state.state_visualization_code = wrapped
+                            st.session_state.state_viz_approved = True
+                            graph = st.session_state.graph
+                            updates = {
+                                "state_visualization_code": wrapped,
+                                "state_viz_approved": True,
+                            }
+                            graph_input = _build_graph_input(updates)
+                            resume_state = run_async(
+                                run_graph_with_events(graph, graph_input, debug_box)
+                            )
+                            if asyncio.isfuture(resume_state):
+                                resume_state = resume_state.result()
+                            _handle_response_state(resume_state, [])
+
     if prompt := st.chat_input("Enter your message"):
         command_state = parse_debug_command(prompt)
         if command_state is not None:
@@ -390,53 +576,18 @@ def main() -> None:
             response_state: Dict[str, Any] = {}
             try:
                 graph = st.session_state.graph
-                metadata = st.session_state.get("state_table_metadata", {})
-                graph_input = {
-                    "state_messages": _lc_messages(st.session_state.history),
-                    "state_table_metadata": metadata,
-                    "state_sql_limit": st.session_state.get("state_sql_limit", DEFAULT_SQL_LIMIT),
-                    "state_loaded_data": st.session_state.get("state_loaded_data"),
-                    "state_loaded_columns": st.session_state.get("state_loaded_columns"),
-                    "state_loaded_table": st.session_state.get("state_loaded_table"),
-                    "state_active_table_metadata": st.session_state.get("state_active_table_metadata"),
-                }
+                graph_input = _build_graph_input()
                 if st.session_state.get("debug_mode"):
                     response_state = run_async(run_graph_with_events(graph, graph_input, debug_box))
                     if asyncio.isfuture(response_state):
                         response_state = response_state.result()
                 else:
-                    response_state = graph.invoke(graph_input)
-                latest = response_state["state_messages"][-1]
-                response_text = latest["content"]
-                node_path = response_state.get("state_node_path", [])
-                st.session_state.state_sql_limit = response_state.get(
-                    "state_sql_limit", DEFAULT_SQL_LIMIT
-                )
+                    response_state = run_async(run_graph_with_events(graph, graph_input, debug_box))
+                    if asyncio.isfuture(response_state):
+                        response_state = response_state.result()
             except Exception as exc:  # pragma: no cover - Streamlit surface
-                response_text = f"⚠️ Error: {exc}"
-                response_state = {}
-            assistant_segments.append(response_text)
-            combined_text = "\n\n".join(segment for segment in assistant_segments if segment)
-            st.session_state.history.append(("assistant", combined_text))
-            message_index = len(st.session_state.history) - 1
-            # Cache data for node_visualization execution without embedding it in the code text.
-            viz_rows = st.session_state.setdefault("viz_rows", {})
-            viz_rows[message_index] = response_state.get("state_loaded_data") if response_state else []
-            viz_tables = st.session_state.setdefault("viz_table_outputs", {})
-            viz_tables[message_index] = response_state.get("state_table_outputs") if response_state else []
-            # Persist loaded data/columns/table across turns for reuse.
-            if response_state:
-                st.session_state.state_loaded_data = response_state.get("state_loaded_data")
-                st.session_state.state_loaded_columns = response_state.get("state_loaded_columns")
-                st.session_state.state_loaded_table = response_state.get("state_loaded_table")
-                st.session_state.state_active_table_metadata = response_state.get("state_active_table_metadata")
-            if node_path and node_path[-1] == "node_error":
-                st.error(response_text)
-            else:
-                st.markdown(response_text)
-            _handle_visualization_blocks(response_text, message_index)
-            _store_node_path(message_index, node_path)
-            _render_node_flow(message_index)
+                response_state = {"state_messages": [{"role": "assistant", "content": f"⚠️ Error: {exc}"}]}
+            _handle_response_state(response_state, assistant_segments)
 
 
 if __name__ == "__main__":

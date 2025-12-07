@@ -289,3 +289,46 @@ class ClarificationRequest(BaseModel):
         ...,
         description="A short Korean question requesting missing details.",
     )
+
+
+class RouteDecision(BaseModel):
+    """LLM-chosen next node for LangGraph routing."""
+
+    next_node: str = Field(
+        ...,
+        description="The next LangGraph node label to run.",
+    )
+    reason: str = Field(
+        default="",
+        description="Short Korean rationale for the node choice.",
+    )
+
+
+def choose_route_with_llm(
+    provider: str,
+    options: List[str],
+    state_summary: Dict[str, Any],
+    history: List[ChatMessage] | None = None,
+    hint: str | None = None,
+) -> RouteDecision:
+    """Ask the LLM to pick the next node based on the current state snapshot."""
+
+    if not options:
+        raise ValueError("At least one routing option is required.")
+    option_text = ", ".join(options)
+    state_json = _safe_json_dumps(state_summary)
+    system_prompt = (
+        "You are the routing brain for a Databricks analytics LangGraph. "
+        "Select the best next node label from the allowed options. "
+        "Prefer safety: if an error is present, choose node_error; if the user only needs a reply without SQL, choose node_respond."
+    )
+    hint_text = f"\nHint: {hint}" if hint else ""
+    user_prompt = (
+        f"Available nodes: {option_text}\n"
+        f"State summary JSON:\n{state_json}\n"
+        "Pick one `next_node` from the available nodes and explain briefly in Korean."
+        f"{hint_text}"
+    )
+    return _call_structured_llm(
+        provider, system_prompt, user_prompt, RouteDecision, history=history
+    )

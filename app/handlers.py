@@ -82,6 +82,8 @@ def _execute_visualization_code(code: str, rows: List[Dict[str, Any]] | None = N
     import matplotlib
 
     matplotlib.use("Agg")
+    import warnings
+    warnings.filterwarnings("ignore", message="FigureCanvasAgg is non-interactive*")
     import matplotlib.pyplot as plt
     import pandas as pd
 
